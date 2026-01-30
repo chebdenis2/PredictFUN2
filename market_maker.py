@@ -83,6 +83,9 @@ except ImportError:
 PREDICT_API_BASE = "https://api.predict.fun"
 PREDICT_API_V1 = f"{PREDICT_API_BASE}/api/v1"
 
+# Alternative API endpoints (check docs for correct one)
+PREDICT_API_GRAPHQL = f"{PREDICT_API_BASE}/graphql"
+
 # Wei conversion (18 decimals for most tokens)
 WEI_DECIMALS = 18
 WEI_MULTIPLIER = 10 ** WEI_DECIMALS
@@ -137,6 +140,10 @@ class BotConfig:
     
     # Fee rate in basis points (default 0 for maker orders)
     fee_rate_bps: int = 0
+    
+    # API Authentication
+    api_key: Optional[str] = None        # API Key (if required)
+    api_secret: Optional[str] = None     # API Secret Key (индивидуально выдаётся)
     
     # Logging
     log_level: str = "INFO"
@@ -251,8 +258,15 @@ class PredictAPIClient:
     Документация: https://dev.predict.fun/
     """
     
-    def __init__(self, logger: logging.Logger):
+    def __init__(
+        self, 
+        logger: logging.Logger,
+        api_key: Optional[str] = None,
+        api_secret: Optional[str] = None
+    ):
         self.logger = logger
+        self.api_key = api_key
+        self.api_secret = api_secret
         self.session: Optional[aiohttp.ClientSession] = None
     
     async def __aenter__(self):
@@ -262,6 +276,34 @@ class PredictAPIClient:
     async def __aexit__(self, *args):
         if self.session:
             await self.session.close()
+    
+    def _get_auth_headers(self) -> dict:
+        """
+        Получить заголовки аутентификации
+        Get authentication headers
+        
+        Формат может отличаться - проверьте документацию:
+        - X-API-Key / X-Api-Key
+        - Authorization: Bearer <secret>
+        - X-Secret-Key
+        """
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+            headers["X-Api-Key"] = self.api_key  # Alternative casing
+        
+        if self.api_secret:
+            # Попробуем несколько вариантов заголовков
+            # Try several header variants
+            headers["X-Secret-Key"] = self.api_secret
+            headers["X-API-Secret"] = self.api_secret
+            headers["Authorization"] = f"Bearer {self.api_secret}"
+        
+        return headers
     
     async def _request(
         self, 
@@ -275,6 +317,9 @@ class PredictAPIClient:
             self.session = aiohttp.ClientSession()
         
         url = f"{PREDICT_API_V1}{endpoint}"
+        headers = self._get_auth_headers()
+        
+        self.logger.debug(f"API Request: {method} {url}")
         
         try:
             async with self.session.request(
@@ -282,7 +327,7 @@ class PredictAPIClient:
                 url, 
                 params=params, 
                 json=json_data,
-                headers={"Content-Type": "application/json"}
+                headers=headers
             ) as response:
                 data = await response.json()
                 
@@ -488,8 +533,15 @@ class MarketMakerBot:
             options=options
         )
         
-        # API Client for REST endpoints
-        self.api_client = PredictAPIClient(self.logger)
+        # API Client for REST endpoints (с аутентификацией)
+        self.api_client = PredictAPIClient(
+            logger=self.logger,
+            api_key=config.api_key,
+            api_secret=config.api_secret
+        )
+        
+        if config.api_secret:
+            self.logger.info(f"🔐 API Secret configured: {config.api_secret[:8]}...{config.api_secret[-4:]}")
         
         # State tracking / Отслеживание состояния
         self.markets: dict[str, MarketState] = {}
@@ -1066,6 +1118,12 @@ def load_config() -> BotConfig:
     if os.getenv("FEE_RATE_BPS"):
         config.fee_rate_bps = int(os.getenv("FEE_RATE_BPS"))
     
+    # API Authentication
+    if os.getenv("API_KEY"):
+        config.api_key = os.getenv("API_KEY")
+    if os.getenv("API_SECRET") or os.getenv("API_SECRET_KEY"):
+        config.api_secret = os.getenv("API_SECRET") or os.getenv("API_SECRET_KEY")
+    
     return config
 
 
@@ -1085,6 +1143,16 @@ async def main():
     
     # Загружаем конфигурацию / Load configuration
     config = load_config()
+    
+    # Проверяем API Secret / Check API Secret
+    if not config.api_secret:
+        print("⚠️  API_SECRET not found in environment!")
+        print("   API Secret Key необходим для работы с Predict.fun API")
+        print("   Добавьте в .env: API_SECRET=your_secret_key")
+        print()
+        api_secret = input("   Введите API Secret Key: ").strip()
+        if api_secret:
+            config.api_secret = api_secret
     
     # Получаем приватный ключ безопасно / Get private key securely
     private_key = os.getenv("PRIVATE_KEY")
