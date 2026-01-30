@@ -482,6 +482,10 @@ class PredictGraphQLClient:
         Авторизация через подпись сообщения
         Login via message signature
         
+        1. Получаем сообщение от API
+        2. Подписываем его
+        3. Отправляем в login mutation
+        
         Returns:
             True if login successful
         """
@@ -489,11 +493,20 @@ class PredictGraphQLClient:
             from eth_account import Account
             from eth_account.messages import encode_defunct
             
-            # Создаём сообщение для подписи
-            timestamp = int(datetime.now().timestamp())
-            message = f"Sign in to Predict.fun\n\nTimestamp: {timestamp}"
+            # 1. Получаем timestamp в миллисекундах
+            timestamp_ms = int(datetime.now().timestamp() * 1000)
             
-            # Подписываем сообщение
+            # 2. Получаем сообщение от API
+            msg_data = await self.execute(GET_LOGIN_MESSAGE_QUERY, {"timestamp": timestamp_ms})
+            message = msg_data.get("message")
+            
+            if not message:
+                self.logger.error("Failed to get login message from API")
+                return False
+            
+            self.logger.info(f"📝 Got login message, signing...")
+            
+            # 3. Подписываем сообщение
             account = Account.from_key(private_key)
             message_encoded = encode_defunct(text=message)
             signed = account.sign_message(message_encoded)
@@ -501,7 +514,7 @@ class PredictGraphQLClient:
             if not signature.startswith("0x"):
                 signature = "0x" + signature
             
-            # Отправляем login mutation
+            # 4. Отправляем login mutation
             data = await self.execute(LOGIN_MUTATION, {
                 "data": {
                     "address": address,
@@ -515,10 +528,10 @@ class PredictGraphQLClient:
             
             if token:
                 self.jwt_token = token
-                self.logger.info(f"🔐 Logged in successfully, token received")
+                self.logger.info(f"🔐 Logged in successfully!")
                 return True
             else:
-                self.logger.error(f"Login failed: no token in response")
+                self.logger.error(f"Login failed: no token in response. Data: {data}")
                 return False
                 
         except Exception as e:
@@ -641,6 +654,12 @@ mutation Login($data: AccountLoginInput!) {
       token
     }
   }
+}
+"""
+
+GET_LOGIN_MESSAGE_QUERY = """
+query GetLoginMessage($timestamp: Timestamp!) {
+  message(timestamp: $timestamp)
 }
 """
 
