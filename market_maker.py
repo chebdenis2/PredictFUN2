@@ -540,27 +540,36 @@ class PredictGraphQLClient:
             self.logger.error(traceback.format_exc())
             return False
     
-    async def create_order(self, order_data: dict) -> dict:
+    async def create_order_rest(self, order_data: dict) -> dict:
         """
-        Создать ордер через GraphQL mutation
-        Create order via GraphQL mutation
+        Создать ордер через REST API (как в рабочем боте)
+        Create order via REST API
         """
-        data = await self.execute(CREATE_ORDER_MUTATION, {"data": order_data})
-        self.logger.info(f"    GraphQL response: {data}")
+        if not self.session:
+            timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
+            self.session = aiohttp.ClientSession(timeout=timeout)
         
-        result = data.get("createOrder", {})
-        if result is None:
-            self.logger.warning("    createOrder returned None")
-            return {}
+        url = "https://api.predict.fun/order"
+        headers = self._get_headers()
         
-        # Возвращаем order если есть, иначе весь результат
-        order = result.get("order") if isinstance(result, dict) else None
-        if order:
-            self.logger.info(f"    ✅ Order created: id={order.get('id')}, status={order.get('status')}")
-            return order
+        # Формат: {"data": {"order": {...}, "pricePerShare": "...", "strategy": "LIMIT"}}
+        payload = {"data": order_data}
         
-        self.logger.warning(f"    No order in response, code={result.get('code') if isinstance(result, dict) else result}")
-        return result if isinstance(result, dict) else {}
+        self.logger.info(f"    Submitting order to REST API...")
+        
+        try:
+            async with self.session.post(url, json=payload, headers=headers) as response:
+                text = await response.text()
+                self.logger.info(f"    REST response ({response.status}): {text[:500]}")
+                
+                if response.status >= 400:
+                    raise Exception(f"Order error {response.status}: {text[:200]}")
+                
+                return json.loads(text) if text else {}
+                
+        except Exception as e:
+            self.logger.error(f"    REST order error: {e}")
+            raise
     
     async def cancel_order(self, order_id: str) -> bool:
         """
@@ -873,33 +882,31 @@ class MarketMakerBot:
             signed_order = self.order_builder.sign_typed_data_order(typed_data)
             self.logger.info(f"    Step 3 OK: Order signed")
             
-            # 4. Build hash for GraphQL
+            # 4. Build hash
             order_hash = self.order_builder.build_typed_data_hash(typed_data)
             
-            # Format for GraphQL CreateOrderInput
-            return {
+            # Format matching the working bot's structure
+            order_payload = {
                 "hash": order_hash,
-                "amount": str(amounts.taker_amount),  # количество shares
-                "feeRateBps": market.maker_fee_bps,
-                "makerFeeBps": market.maker_fee_bps,
-                "takerFeeBps": market.taker_fee_bps,
-                "marketId": int(market.market_id) if market.market_id.isdigit() else 0,
-                "nonce": int(order.nonce),
-                "priceInCurrency": str(price_wei),
-                "quoteType": False,  # price quote, not amount quote
-                "expiresAt": expires_at.isoformat(),
+                "salt": str(signed_order.salt),
+                "maker": signed_order.maker,
+                "signer": signed_order.signer,
+                "taker": signed_order.taker,
+                "tokenId": str(signed_order.token_id),
+                "makerAmount": str(signed_order.maker_amount),
+                "takerAmount": str(signed_order.taker_amount),
+                "expiration": str(signed_order.expiration),
+                "nonce": str(signed_order.nonce),
+                "feeRateBps": str(signed_order.fee_rate_bps),
+                "side": int(signed_order.side.value if hasattr(signed_order.side, 'value') else signed_order.side),
+                "signatureType": int(signed_order.signature_type.value if hasattr(signed_order.signature_type, 'value') else signed_order.signature_type),
                 "signature": signed_order.signature,
-                "signatureType": int(order.signature_type.value if hasattr(order.signature_type, 'value') else order.signature_type),
-                "signer": order.signer,
-                "maker": order.maker,
-                "slippageBps": 0,
+            }
+            
+            return {
+                "order": order_payload,
+                "pricePerShare": str(amounts.price_per_share),
                 "strategy": "LIMIT",
-                "tokenId": str(outcome.on_chain_id),
-                "salt": str(order.salt),
-                "currency": "USDT",
-                "isFillOrKill": False,
-                "takerAmount": str(order.taker_amount),
-                "makerAmount": str(order.maker_amount),
             }
             
         except Exception as e:
@@ -999,8 +1006,8 @@ class MarketMakerBot:
             if not order_data:
                 return None
             
-            # Отправляем через GraphQL
-            result = await self.graphql_client.create_order(order_data)
+            # Отправляем через REST API (как в рабочем боте)
+            result = await self.graphql_client.create_order_rest(order_data)
             
             if not result or not result.get("id"):
                 self.logger.warning(f"    Order created but no ID returned")
