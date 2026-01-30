@@ -37,11 +37,14 @@ import logging
 import os
 import sys
 import time
+import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Optional, Literal
+
+import aiohttp
 
 # Third-party imports
 try:
@@ -52,23 +55,41 @@ except ImportError:
 
 try:
     from predict_sdk import (
-        PredictClient,
+        OrderBuilder,
+        OrderBuilderOptions,
         ChainId,
-        OrderSide,
-        OrderType,
+        Side,
+        BuildOrderInput,
+        LimitHelperInput,
+        SignedOrder,
     )
-    from predict_sdk.types import Market, Order, Position
 except ImportError:
-    print("❌ Установите predict-sdk: pip install predict-sdk")
+    print("❌ Установите predict-sdk: pip install predict-sdk==0.0.12")
     print("   Документация: https://github.com/PredictDotFun/sdk-python")
     sys.exit(1)
 
 try:
-    from web3 import Web3
     from eth_account import Account
 except ImportError:
     print("❌ Установите web3: pip install web3")
     sys.exit(1)
+
+
+# ================================================================================
+# CONSTANTS / КОНСТАНТЫ
+# ================================================================================
+
+# Predict.fun REST API
+PREDICT_API_BASE = "https://api.predict.fun"
+PREDICT_API_V1 = f"{PREDICT_API_BASE}/api/v1"
+
+# Wei conversion (18 decimals for most tokens)
+WEI_DECIMALS = 18
+WEI_MULTIPLIER = 10 ** WEI_DECIMALS
+
+# USDC/USDT typically has 6 decimals
+USDC_DECIMALS = 6
+USDC_MULTIPLIER = 10 ** USDC_DECIMALS
 
 
 # ================================================================================
@@ -82,7 +103,7 @@ class BotConfig:
     Все параметры можно переопределить через переменные окружения
     """
     # Chain settings / Настройки сети
-    chain_id: int = ChainId.BnbMainnet
+    chain_id: ChainId = ChainId.BNB_MAINNET
     
     # Market filters / Фильтры рынков
     min_oi_usd: float = 0.0          # Минимальный Open Interest ($)
@@ -99,19 +120,23 @@ class BotConfig:
     # Timing / Тайминги
     rebalance_interval_sec: int = 300   # Интервал ребалансировки (5 минут)
     price_change_threshold: float = 0.02  # Порог изменения цены для ребалансировки
+    order_expiry_minutes: int = 60       # Время жизни ордера (минуты)
     
     # Safety / Безопасность
     max_total_exposure_usd: float = 500.0  # Макс. общая позиция в USD
     max_slippage: float = 0.05             # Макс. проскальзывание (5%)
-    
-    # Gas settings / Настройки газа
-    max_gas_price_gwei: float = 10.0       # Макс. цена газа в Gwei
     
     # Rate limits
     api_delay_sec: float = 0.5             # Задержка между API вызовами
     
     # Market IDs to trade (empty = auto-select) / ID рынков для торговли
     market_ids: list[str] = field(default_factory=list)
+    
+    # Predict Account (smart wallet address)
+    predict_account: Optional[str] = None
+    
+    # Fee rate in basis points (default 0 for maker orders)
+    fee_rate_bps: int = 0
     
     # Logging
     log_level: str = "INFO"
@@ -127,29 +152,51 @@ class OrderStatus(Enum):
 
 
 @dataclass
+class MarketData:
+    """Данные рынка из API"""
+    market_id: str
+    question_id: str
+    title: str
+    yes_token_id: str
+    no_token_id: str
+    yes_price: Decimal
+    no_price: Decimal
+    open_interest_usd: Decimal
+    volume_24h_usd: Decimal
+    end_date: Optional[datetime]
+    neg_risk: bool = False
+
+
+@dataclass
+class OrderbookData:
+    """Данные ордербука"""
+    yes_best_bid: Optional[Decimal]
+    yes_best_ask: Optional[Decimal]
+    no_best_bid: Optional[Decimal]
+    no_best_ask: Optional[Decimal]
+    yes_mid_price: Decimal
+    no_mid_price: Decimal
+
+
+@dataclass
 class OrderInfo:
     """Информация об ордере"""
-    order_id: str
+    order_hash: str
     market_id: str
-    side: str  # "YES" or "NO"
-    order_side: str  # "BUY" or "SELL"
+    token_id: str
+    side: Side  # BUY or SELL
     price: Decimal
-    size: Decimal
+    size_wei: int
     status: OrderStatus
     created_at: datetime
-    filled_amount: Decimal = Decimal("0")
+    expires_at: datetime
 
 
 @dataclass
 class MarketState:
     """Состояние рынка"""
-    market_id: str
-    title: str
-    yes_price: Decimal
-    no_price: Decimal
-    mid_price: Decimal
-    open_interest: Decimal
-    volume_24h: Decimal
+    market: MarketData
+    orderbook: Optional[OrderbookData] = None
     our_orders: list[OrderInfo] = field(default_factory=list)
     last_rebalance: Optional[datetime] = None
 
@@ -164,6 +211,9 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
     """
     logger = logging.getLogger("PredictMM")
     logger.setLevel(getattr(logging, level.upper()))
+    
+    # Remove existing handlers
+    logger.handlers.clear()
     
     # Console handler
     console_handler = logging.StreamHandler()
@@ -187,6 +237,205 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
     logger.addHandler(file_handler)
     
     return logger
+
+
+# ================================================================================
+# PREDICT API CLIENT / КЛИЕНТ PREDICT API
+# ================================================================================
+
+class PredictAPIClient:
+    """
+    REST API клиент для Predict.fun
+    Получает данные о рынках, ордербуках, отправляет ордера
+    
+    Документация: https://dev.predict.fun/
+    """
+    
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.session: Optional[aiohttp.ClientSession] = None
+    
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession()
+        return self
+    
+    async def __aexit__(self, *args):
+        if self.session:
+            await self.session.close()
+    
+    async def _request(
+        self, 
+        method: str, 
+        endpoint: str, 
+        params: dict = None,
+        json_data: dict = None
+    ) -> dict:
+        """Make HTTP request to API"""
+        if not self.session:
+            self.session = aiohttp.ClientSession()
+        
+        url = f"{PREDICT_API_V1}{endpoint}"
+        
+        try:
+            async with self.session.request(
+                method, 
+                url, 
+                params=params, 
+                json=json_data,
+                headers={"Content-Type": "application/json"}
+            ) as response:
+                data = await response.json()
+                
+                if response.status >= 400:
+                    self.logger.error(f"API Error {response.status}: {data}")
+                    raise Exception(f"API Error: {data}")
+                
+                return data
+                
+        except aiohttp.ClientError as e:
+            self.logger.error(f"HTTP Error: {e}")
+            raise
+    
+    async def get_markets(
+        self, 
+        status: str = "active",
+        limit: int = 100,
+        offset: int = 0
+    ) -> list[MarketData]:
+        """
+        Получить список рынков / Get list of markets
+        
+        GET /api/v1/markets
+        """
+        params = {
+            "status": status,
+            "limit": limit,
+            "offset": offset
+        }
+        
+        data = await self._request("GET", "/markets", params=params)
+        
+        markets = []
+        for item in data.get("markets", data.get("data", [])):
+            try:
+                # Парсим данные рынка
+                market = MarketData(
+                    market_id=str(item.get("id") or item.get("marketId")),
+                    question_id=str(item.get("questionId", "")),
+                    title=item.get("title", item.get("question", "Unknown")),
+                    yes_token_id=str(item.get("yesTokenId", item.get("outcomes", [{}])[0].get("tokenId", ""))),
+                    no_token_id=str(item.get("noTokenId", item.get("outcomes", [{}])[-1].get("tokenId", "") if len(item.get("outcomes", [])) > 1 else "")),
+                    yes_price=Decimal(str(item.get("yesPrice", item.get("lastPrice", 0.5)))),
+                    no_price=Decimal(str(item.get("noPrice", 1 - float(item.get("yesPrice", item.get("lastPrice", 0.5)))))),
+                    open_interest_usd=Decimal(str(item.get("openInterestUsd", item.get("openInterest", 0)))),
+                    volume_24h_usd=Decimal(str(item.get("volume24hUsd", item.get("volume24h", 0)))),
+                    end_date=None,  # Parse if available
+                    neg_risk=item.get("negRisk", False)
+                )
+                markets.append(market)
+            except Exception as e:
+                self.logger.debug(f"Error parsing market: {e}")
+                continue
+        
+        return markets
+    
+    async def get_market(self, market_id: str) -> Optional[MarketData]:
+        """
+        Получить данные одного рынка / Get single market data
+        
+        GET /api/v1/markets/{market_id}
+        """
+        try:
+            data = await self._request("GET", f"/markets/{market_id}")
+            item = data.get("market", data)
+            
+            return MarketData(
+                market_id=str(item.get("id") or item.get("marketId")),
+                question_id=str(item.get("questionId", "")),
+                title=item.get("title", item.get("question", "Unknown")),
+                yes_token_id=str(item.get("yesTokenId", "")),
+                no_token_id=str(item.get("noTokenId", "")),
+                yes_price=Decimal(str(item.get("yesPrice", 0.5))),
+                no_price=Decimal(str(item.get("noPrice", 0.5))),
+                open_interest_usd=Decimal(str(item.get("openInterestUsd", 0))),
+                volume_24h_usd=Decimal(str(item.get("volume24hUsd", 0))),
+                end_date=None,
+                neg_risk=item.get("negRisk", False)
+            )
+        except Exception as e:
+            self.logger.error(f"Error fetching market {market_id}: {e}")
+            return None
+    
+    async def get_orderbook(self, market_id: str) -> Optional[OrderbookData]:
+        """
+        Получить ордербук рынка / Get market orderbook
+        
+        GET /api/v1/markets/{market_id}/orderbook
+        """
+        try:
+            data = await self._request("GET", f"/markets/{market_id}/orderbook")
+            
+            # Parse bids and asks
+            yes_bids = data.get("yesBids", data.get("bids", []))
+            yes_asks = data.get("yesAsks", data.get("asks", []))
+            no_bids = data.get("noBids", [])
+            no_asks = data.get("noAsks", [])
+            
+            yes_best_bid = Decimal(str(yes_bids[0]["price"])) if yes_bids else None
+            yes_best_ask = Decimal(str(yes_asks[0]["price"])) if yes_asks else None
+            no_best_bid = Decimal(str(no_bids[0]["price"])) if no_bids else None
+            no_best_ask = Decimal(str(no_asks[0]["price"])) if no_asks else None
+            
+            # Calculate mid prices
+            if yes_best_bid and yes_best_ask:
+                yes_mid = (yes_best_bid + yes_best_ask) / 2
+            elif yes_best_bid:
+                yes_mid = yes_best_bid
+            elif yes_best_ask:
+                yes_mid = yes_best_ask
+            else:
+                yes_mid = Decimal("0.5")
+            
+            no_mid = Decimal("1") - yes_mid
+            
+            return OrderbookData(
+                yes_best_bid=yes_best_bid,
+                yes_best_ask=yes_best_ask,
+                no_best_bid=no_best_bid,
+                no_best_ask=no_best_ask,
+                yes_mid_price=yes_mid,
+                no_mid_price=no_mid
+            )
+            
+        except Exception as e:
+            self.logger.warning(f"Error fetching orderbook for {market_id}: {e}")
+            return None
+    
+    async def submit_order(self, signed_order: dict) -> dict:
+        """
+        Отправить подписанный ордер / Submit signed order
+        
+        POST /api/v1/orders
+        """
+        return await self._request("POST", "/orders", json_data=signed_order)
+    
+    async def cancel_order(self, order_hash: str) -> dict:
+        """
+        Отменить ордер / Cancel order
+        
+        DELETE /api/v1/orders/{order_hash}
+        """
+        return await self._request("DELETE", f"/orders/{order_hash}")
+    
+    async def get_orders(self, maker: str, status: str = "open") -> list[dict]:
+        """
+        Получить ордера пользователя / Get user orders
+        
+        GET /api/v1/orders
+        """
+        params = {"maker": maker, "status": status}
+        data = await self._request("GET", "/orders", params=params)
+        return data.get("orders", data.get("data", []))
 
 
 # ================================================================================
@@ -215,17 +464,32 @@ class MarketMakerBot:
         self.config = config
         self.logger = setup_logging(config.log_level)
         
-        # Initialize Web3 and Account
+        # Initialize Account from private key
         self.account = Account.from_key(private_key)
         self.address = self.account.address
         self.logger.info(f"🔑 Wallet initialized: {self.address[:10]}...{self.address[-6:]}")
         
-        # Initialize Predict SDK Client
-        # Используем официальный SDK для работы с Predict.fun
-        self.client = PredictClient(
-            chain_id=config.chain_id,
-            private_key=private_key,
+        # Predict Account (smart wallet) - if provided
+        self.predict_account = config.predict_account
+        if self.predict_account:
+            self.logger.info(f"📱 Predict Account: {self.predict_account[:10]}...{self.predict_account[-6:]}")
+        
+        # Initialize Predict SDK OrderBuilder
+        # Используем официальный SDK для построения и подписания ордеров
+        options = OrderBuilderOptions(
+            precision=WEI_DECIMALS,
+            predict_account=self.predict_account,
+            log_level=config.log_level
         )
+        
+        self.order_builder = OrderBuilder.make(
+            chain_id=config.chain_id,
+            signer=private_key,
+            options=options
+        )
+        
+        # API Client for REST endpoints
+        self.api_client = PredictAPIClient(self.logger)
         
         # State tracking / Отслеживание состояния
         self.markets: dict[str, MarketState] = {}
@@ -243,7 +507,7 @@ class MarketMakerBot:
         
         self.logger.info("✅ MarketMakerBot initialized successfully")
     
-    async def get_suitable_markets(self) -> list[Market]:
+    async def get_suitable_markets(self) -> list[MarketData]:
         """
         Получить подходящие рынки для маркет-мейкинга
         Get suitable markets for market making
@@ -254,59 +518,50 @@ class MarketMakerBot:
         - Рынок активен и принимает ордера
         
         Returns:
-            List of suitable Market objects
+            List of suitable MarketData objects
         """
         self.logger.info("🔍 Searching for suitable markets...")
         
         try:
-            # Получаем список всех активных рынков через SDK
-            # Get all active markets via SDK
-            all_markets = await self.client.get_markets(
-                status="active",
-                limit=100
-            )
+            # Получаем список всех активных рынков через REST API
+            all_markets = await self.api_client.get_markets(status="active", limit=100)
             
             suitable = []
             
             for market in all_markets:
                 # Пропускаем, если указаны конкретные market_ids
-                # Skip if specific market_ids are configured
-                if self.config.market_ids and market.id not in self.config.market_ids:
+                if self.config.market_ids and market.market_id not in self.config.market_ids:
                     continue
                 
-                # Получаем текущие цены / Get current prices
-                try:
-                    orderbook = await self.client.get_orderbook(market.id)
-                    yes_price = Decimal(str(orderbook.yes_best_ask or orderbook.yes_mid_price or 0.5))
-                    
-                    # Проверяем Open Interest
-                    oi_usd = float(market.open_interest_usd or 0)
-                    if oi_usd > self.config.max_oi_usd:
-                        self.logger.debug(f"  ⏭️  {market.title[:40]}... - OI too high: ${oi_usd:,.0f}")
-                        continue
-                    if oi_usd < self.config.min_oi_usd:
-                        self.logger.debug(f"  ⏭️  {market.title[:40]}... - OI too low: ${oi_usd:,.0f}")
-                        continue
-                    
-                    # Проверяем вероятность (цена YES = вероятность)
-                    probability = float(yes_price)
-                    if not (self.config.min_probability <= probability <= self.config.max_probability):
-                        self.logger.debug(
-                            f"  ⏭️  {market.title[:40]}... - "
-                            f"probability {probability:.1%} outside range"
-                        )
-                        continue
-                    
-                    # Рынок подходит! / Market is suitable!
-                    suitable.append(market)
-                    self.logger.info(
-                        f"  ✅ {market.title[:50]}... | "
-                        f"OI: ${oi_usd:,.0f} | Prob: {probability:.1%}"
-                    )
-                    
-                except Exception as e:
-                    self.logger.warning(f"  ⚠️  Error checking market {market.id}: {e}")
+                # Проверяем Open Interest
+                oi_usd = float(market.open_interest_usd)
+                if oi_usd > self.config.max_oi_usd:
+                    self.logger.debug(f"  ⏭️  {market.title[:40]}... - OI too high: ${oi_usd:,.0f}")
                     continue
+                if oi_usd < self.config.min_oi_usd:
+                    self.logger.debug(f"  ⏭️  {market.title[:40]}... - OI too low: ${oi_usd:,.0f}")
+                    continue
+                
+                # Проверяем вероятность (цена YES = вероятность)
+                probability = float(market.yes_price)
+                if not (self.config.min_probability <= probability <= self.config.max_probability):
+                    self.logger.debug(
+                        f"  ⏭️  {market.title[:40]}... - "
+                        f"probability {probability:.1%} outside range"
+                    )
+                    continue
+                
+                # Проверяем наличие token IDs
+                if not market.yes_token_id or not market.no_token_id:
+                    self.logger.debug(f"  ⏭️  {market.title[:40]}... - missing token IDs")
+                    continue
+                
+                # Рынок подходит! / Market is suitable!
+                suitable.append(market)
+                self.logger.info(
+                    f"  ✅ {market.title[:50]}... | "
+                    f"OI: ${oi_usd:,.0f} | Prob: {probability:.1%}"
+                )
                 
                 # Rate limiting
                 await asyncio.sleep(self.config.api_delay_sec)
@@ -320,20 +575,22 @@ class MarketMakerBot:
     
     def calculate_order_params(
         self, 
-        mid_price: Decimal
-    ) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+        mid_price: Decimal,
+        order_size_usd: Optional[float] = None
+    ) -> tuple[Decimal, Decimal, int, int]:
         """
         Рассчитать параметры ордеров (bid/ask цены и размеры)
         Calculate order parameters (bid/ask prices and sizes)
         
         Args:
             mid_price: Средняя цена (YES probability)
+            order_size_usd: Размер ордера в USD (опционально)
             
         Returns:
-            Tuple of (bid_price, ask_price, bid_size, ask_size)
+            Tuple of (bid_price, ask_price, bid_size_wei, ask_size_wei)
         """
         spread = Decimal(str(self.config.target_spread))
-        order_size = Decimal(str(self.config.order_size_usd))
+        order_size = Decimal(str(order_size_usd or self.config.order_size_usd))
         
         # Bid ниже mid, Ask выше mid
         # Bid below mid, Ask above mid
@@ -345,14 +602,90 @@ class MarketMakerBot:
         bid_price = max(Decimal("0.01"), min(Decimal("0.99"), bid_price))
         ask_price = max(Decimal("0.01"), min(Decimal("0.99"), ask_price))
         
-        # Размер в контрактах = USD / цена
-        # Size in contracts = USD / price
-        bid_size = order_size / bid_price
-        ask_size = order_size / ask_price
+        # Размер в wei = (USD * 10^6) / price (для USDC с 6 decimals)
+        # Predict использует shares с precision 18
+        bid_size_wei = int((order_size / bid_price) * WEI_MULTIPLIER)
+        ask_size_wei = int((order_size / ask_price) * WEI_MULTIPLIER)
         
-        return bid_price, ask_price, bid_size, ask_size
+        return bid_price, ask_price, bid_size_wei, ask_size_wei
     
-    async def place_limit_orders(self, market: Market) -> list[OrderInfo]:
+    def price_to_wei(self, price: Decimal) -> int:
+        """Convert price (0-1) to wei (price per share in wei)"""
+        return int(price * WEI_MULTIPLIER)
+    
+    async def build_and_sign_order(
+        self,
+        token_id: str,
+        side: Side,
+        price: Decimal,
+        quantity_wei: int,
+    ) -> Optional[dict]:
+        """
+        Построить и подписать ордер используя SDK
+        Build and sign order using SDK
+        
+        Args:
+            token_id: ID токена (YES или NO)
+            side: Side.BUY или Side.SELL
+            price: Цена за share (0-1)
+            quantity_wei: Количество shares в wei
+            
+        Returns:
+            Signed order dict ready for submission, or None on error
+        """
+        try:
+            # Рассчитываем amounts через SDK helper
+            price_wei = self.price_to_wei(price)
+            
+            limit_input = LimitHelperInput(
+                side=side,
+                price_per_share_wei=price_wei,
+                quantity_wei=quantity_wei
+            )
+            
+            amounts = self.order_builder.get_limit_order_amounts(limit_input)
+            
+            # Строим ордер
+            expires_at = datetime.now() + timedelta(minutes=self.config.order_expiry_minutes)
+            
+            order_input = BuildOrderInput(
+                side=side,
+                token_id=token_id,
+                maker_amount=str(amounts.maker),
+                taker_amount=str(amounts.taker),
+                fee_rate_bps=str(self.config.fee_rate_bps),
+                expires_at=expires_at
+            )
+            
+            order = self.order_builder.build_order(strategy="LIMIT", data=order_input)
+            
+            # Подписываем ордер
+            signed_order = self.order_builder.sign_typed_data_order(order)
+            
+            return {
+                "order": {
+                    "salt": str(order.salt),
+                    "maker": order.maker,
+                    "signer": order.signer,
+                    "taker": order.taker,
+                    "tokenId": str(order.token_id),
+                    "makerAmount": str(order.maker_amount),
+                    "takerAmount": str(order.taker_amount),
+                    "expiration": str(int(order.expiration.timestamp())) if order.expiration else "0",
+                    "nonce": str(order.nonce),
+                    "feeRateBps": str(order.fee_rate_bps),
+                    "side": "BUY" if side == Side.BUY else "SELL",
+                    "signatureType": str(order.signature_type.value if order.signature_type else 0),
+                },
+                "signature": signed_order.signature,
+                "orderHash": signed_order.order_hash if hasattr(signed_order, 'order_hash') else None
+            }
+            
+        except Exception as e:
+            self.logger.error(f"❌ Error building order: {e}")
+            return None
+    
+    async def place_limit_orders(self, market: MarketData) -> list[OrderInfo]:
         """
         Разместить лимит-ордера на обеих сторонах рынка
         Place limit orders on both sides of the market
@@ -361,7 +694,7 @@ class MarketMakerBot:
         Delta-neutral strategy: equal volume on YES and NO
         
         Args:
-            market: Market object
+            market: MarketData object
             
         Returns:
             List of placed OrderInfo objects
@@ -371,106 +704,107 @@ class MarketMakerBot:
         
         try:
             # Получаем текущий orderbook / Get current orderbook
-            orderbook = await self.client.get_orderbook(market.id)
+            orderbook = await self.api_client.get_orderbook(market.market_id)
             
-            # Рассчитываем mid price
-            yes_mid = Decimal(str(orderbook.yes_mid_price or 0.5))
+            if orderbook:
+                yes_mid = orderbook.yes_mid_price
+            else:
+                yes_mid = market.yes_price
             
             # Рассчитываем параметры ордеров
-            bid_price, ask_price, bid_size, ask_size = self.calculate_order_params(yes_mid)
+            bid_price, ask_price, bid_size_wei, ask_size_wei = self.calculate_order_params(yes_mid)
             
             self.logger.info(
                 f"  📊 Mid: {yes_mid:.4f} | "
-                f"Bid: {bid_price:.4f} ({bid_size:.2f}) | "
-                f"Ask: {ask_price:.4f} ({ask_size:.2f})"
+                f"Bid: {bid_price:.4f} | "
+                f"Ask: {ask_price:.4f}"
             )
             
             # ----------------------------------------------------------------
             # Размещаем ордер на покупку YES (bid)
             # Place YES buy order (bid)
             # ----------------------------------------------------------------
-            try:
-                yes_buy_order = await self.client.create_order(
-                    market_id=market.id,
-                    outcome="YES",
-                    side=OrderSide.BUY,
-                    order_type=OrderType.LIMIT,
-                    price=float(bid_price),
-                    size=float(bid_size),
-                )
-                
-                order_info = OrderInfo(
-                    order_id=yes_buy_order.id,
-                    market_id=market.id,
-                    side="YES",
-                    order_side="BUY",
-                    price=bid_price,
-                    size=bid_size,
-                    status=OrderStatus.OPEN,
-                    created_at=datetime.now()
-                )
-                placed_orders.append(order_info)
-                self.active_orders[yes_buy_order.id] = order_info
-                self.orders_placed += 1
-                
-                self.logger.info(f"  ✅ YES BUY order placed: {bid_price:.4f} x {bid_size:.2f}")
-                
-            except Exception as e:
-                self.logger.error(f"  ❌ Failed to place YES BUY order: {e}")
+            if market.yes_token_id:
+                try:
+                    signed_order = await self.build_and_sign_order(
+                        token_id=market.yes_token_id,
+                        side=Side.BUY,
+                        price=bid_price,
+                        quantity_wei=bid_size_wei
+                    )
+                    
+                    if signed_order:
+                        result = await self.api_client.submit_order(signed_order)
+                        
+                        order_info = OrderInfo(
+                            order_hash=result.get("orderHash", signed_order.get("orderHash", "")),
+                            market_id=market.market_id,
+                            token_id=market.yes_token_id,
+                            side=Side.BUY,
+                            price=bid_price,
+                            size_wei=bid_size_wei,
+                            status=OrderStatus.OPEN,
+                            created_at=datetime.now(),
+                            expires_at=datetime.now() + timedelta(minutes=self.config.order_expiry_minutes)
+                        )
+                        placed_orders.append(order_info)
+                        self.active_orders[order_info.order_hash] = order_info
+                        self.orders_placed += 1
+                        
+                        self.logger.info(f"  ✅ YES BUY order placed: {bid_price:.4f}")
+                        
+                except Exception as e:
+                    self.logger.error(f"  ❌ Failed to place YES BUY order: {e}")
             
             await asyncio.sleep(self.config.api_delay_sec)
             
             # ----------------------------------------------------------------
             # Размещаем ордер на покупку NO (для delta-neutral)
             # Place NO buy order (for delta-neutral)
-            # NO price = 1 - YES price
+            # NO price = 1 - YES ask price (we want to buy NO when YES is expensive)
             # ----------------------------------------------------------------
-            try:
-                no_bid_price = Decimal("1") - ask_price  # Инвертируем для NO
-                no_size = ask_size
-                
-                no_buy_order = await self.client.create_order(
-                    market_id=market.id,
-                    outcome="NO",
-                    side=OrderSide.BUY,
-                    order_type=OrderType.LIMIT,
-                    price=float(no_bid_price),
-                    size=float(no_size),
-                )
-                
-                order_info = OrderInfo(
-                    order_id=no_buy_order.id,
-                    market_id=market.id,
-                    side="NO",
-                    order_side="BUY",
-                    price=no_bid_price,
-                    size=no_size,
-                    status=OrderStatus.OPEN,
-                    created_at=datetime.now()
-                )
-                placed_orders.append(order_info)
-                self.active_orders[no_buy_order.id] = order_info
-                self.orders_placed += 1
-                
-                self.logger.info(f"  ✅ NO BUY order placed: {no_bid_price:.4f} x {no_size:.2f}")
-                
-            except Exception as e:
-                self.logger.error(f"  ❌ Failed to place NO BUY order: {e}")
+            if market.no_token_id:
+                try:
+                    no_bid_price = Decimal("1") - ask_price  # Инвертируем для NO
+                    no_bid_price = max(Decimal("0.01"), min(Decimal("0.99"), no_bid_price))
+                    
+                    signed_order = await self.build_and_sign_order(
+                        token_id=market.no_token_id,
+                        side=Side.BUY,
+                        price=no_bid_price,
+                        quantity_wei=ask_size_wei
+                    )
+                    
+                    if signed_order:
+                        result = await self.api_client.submit_order(signed_order)
+                        
+                        order_info = OrderInfo(
+                            order_hash=result.get("orderHash", signed_order.get("orderHash", "")),
+                            market_id=market.market_id,
+                            token_id=market.no_token_id,
+                            side=Side.BUY,
+                            price=no_bid_price,
+                            size_wei=ask_size_wei,
+                            status=OrderStatus.OPEN,
+                            created_at=datetime.now(),
+                            expires_at=datetime.now() + timedelta(minutes=self.config.order_expiry_minutes)
+                        )
+                        placed_orders.append(order_info)
+                        self.active_orders[order_info.order_hash] = order_info
+                        self.orders_placed += 1
+                        
+                        self.logger.info(f"  ✅ NO BUY order placed: {no_bid_price:.4f}")
+                        
+                except Exception as e:
+                    self.logger.error(f"  ❌ Failed to place NO BUY order: {e}")
             
             # Обновляем состояние рынка / Update market state
-            if market.id not in self.markets:
-                self.markets[market.id] = MarketState(
-                    market_id=market.id,
-                    title=market.title,
-                    yes_price=yes_mid,
-                    no_price=Decimal("1") - yes_mid,
-                    mid_price=yes_mid,
-                    open_interest=Decimal(str(market.open_interest_usd or 0)),
-                    volume_24h=Decimal(str(market.volume_24h_usd or 0)),
-                )
+            if market.market_id not in self.markets:
+                self.markets[market.market_id] = MarketState(market=market)
             
-            self.markets[market.id].our_orders = placed_orders
-            self.markets[market.id].last_rebalance = datetime.now()
+            self.markets[market.market_id].orderbook = orderbook
+            self.markets[market.market_id].our_orders = placed_orders
+            self.markets[market.market_id].last_rebalance = datetime.now()
             
             return placed_orders
             
@@ -492,22 +826,22 @@ class MarketMakerBot:
         cancelled_count = 0
         orders_to_cancel = []
         
-        for order_id, order in self.active_orders.items():
+        for order_hash, order in self.active_orders.items():
             if market_id and order.market_id != market_id:
                 continue
             if order.status == OrderStatus.OPEN:
-                orders_to_cancel.append(order_id)
+                orders_to_cancel.append(order_hash)
         
-        for order_id in orders_to_cancel:
+        for order_hash in orders_to_cancel:
             try:
-                await self.client.cancel_order(order_id)
-                self.active_orders[order_id].status = OrderStatus.CANCELLED
+                await self.api_client.cancel_order(order_hash)
+                self.active_orders[order_hash].status = OrderStatus.CANCELLED
                 cancelled_count += 1
                 self.orders_cancelled += 1
-                self.logger.info(f"  🗑️  Cancelled order: {order_id[:16]}...")
+                self.logger.info(f"  🗑️  Cancelled order: {order_hash[:16]}...")
                 
             except Exception as e:
-                self.logger.warning(f"  ⚠️  Failed to cancel order {order_id}: {e}")
+                self.logger.warning(f"  ⚠️  Failed to cancel order {order_hash}: {e}")
             
             await asyncio.sleep(self.config.api_delay_sec)
         
@@ -518,34 +852,36 @@ class MarketMakerBot:
         Проверить статус ордеров и обновить PnL
         Check order status and update PnL
         """
-        for order_id, order in list(self.active_orders.items()):
-            if order.status not in [OrderStatus.OPEN, OrderStatus.PENDING]:
-                continue
+        try:
+            maker_address = self.predict_account or self.address
+            open_orders = await self.api_client.get_orders(maker_address, "open")
+            filled_orders = await self.api_client.get_orders(maker_address, "filled")
             
-            try:
-                order_status = await self.client.get_order(order_id)
+            open_hashes = {o.get("orderHash") for o in open_orders}
+            filled_hashes = {o.get("orderHash") for o in filled_orders}
+            
+            for order_hash, order in list(self.active_orders.items()):
+                if order.status != OrderStatus.OPEN:
+                    continue
                 
-                if order_status.status == "filled":
+                if order_hash in filled_hashes:
                     order.status = OrderStatus.FILLED
-                    order.filled_amount = Decimal(str(order_status.filled_amount or order.size))
                     self.orders_filled += 1
-                    
-                    # Рассчитываем влияние на PnL
-                    # Calculate PnL impact
                     self.logger.info(
-                        f"  💰 Order FILLED: {order.side} {order.order_side} | "
-                        f"Price: {order.price:.4f} | Size: {order.filled_amount:.2f}"
+                        f"  💰 Order FILLED: {'YES' if 'yes' in order.token_id.lower() else 'NO'} "
+                        f"{order.side.name} | Price: {order.price:.4f}"
                     )
-                    
-                elif order_status.status == "cancelled":
-                    order.status = OrderStatus.CANCELLED
-                    
-            except Exception as e:
-                self.logger.debug(f"  ⚠️  Error checking order {order_id}: {e}")
-            
-            await asyncio.sleep(self.config.api_delay_sec / 2)
+                elif order_hash not in open_hashes:
+                    # Order might be cancelled or expired
+                    if datetime.now() > order.expires_at:
+                        order.status = OrderStatus.EXPIRED
+                    else:
+                        order.status = OrderStatus.CANCELLED
+                        
+        except Exception as e:
+            self.logger.debug(f"  ⚠️  Error checking orders: {e}")
     
-    async def should_rebalance(self, market: MarketState) -> bool:
+    async def should_rebalance(self, market_state: MarketState) -> bool:
         """
         Проверить, нужна ли ребалансировка
         Check if rebalancing is needed
@@ -554,23 +890,25 @@ class MarketMakerBot:
             True if rebalancing is needed
         """
         # Проверяем время с последней ребалансировки
-        if market.last_rebalance:
-            time_since = (datetime.now() - market.last_rebalance).total_seconds()
+        if market_state.last_rebalance:
+            time_since = (datetime.now() - market_state.last_rebalance).total_seconds()
             if time_since < self.config.rebalance_interval_sec:
                 return False
         
         # Проверяем изменение цены
         try:
-            orderbook = await self.client.get_orderbook(market.market_id)
-            current_mid = Decimal(str(orderbook.yes_mid_price or 0.5))
-            
-            price_change = abs(current_mid - market.mid_price)
-            if price_change > Decimal(str(self.config.price_change_threshold)):
-                self.logger.info(
-                    f"  📈 Price changed: {market.mid_price:.4f} → {current_mid:.4f} "
-                    f"(Δ{price_change:.4f})"
-                )
-                return True
+            orderbook = await self.api_client.get_orderbook(market_state.market.market_id)
+            if orderbook and market_state.orderbook:
+                current_mid = orderbook.yes_mid_price
+                old_mid = market_state.orderbook.yes_mid_price
+                
+                price_change = abs(current_mid - old_mid)
+                if price_change > Decimal(str(self.config.price_change_threshold)):
+                    self.logger.info(
+                        f"  📈 Price changed: {old_mid:.4f} → {current_mid:.4f} "
+                        f"(Δ{price_change:.4f})"
+                    )
+                    return True
             
         except Exception as e:
             self.logger.warning(f"  ⚠️  Error checking price: {e}")
@@ -592,7 +930,7 @@ class MarketMakerBot:
                 # Проверяем каждый рынок на необходимость ребалансировки
                 for market_id, market_state in list(self.markets.items()):
                     if await self.should_rebalance(market_state):
-                        self.logger.info(f"🔄 Rebalancing: {market_state.title[:40]}...")
+                        self.logger.info(f"🔄 Rebalancing: {market_state.market.title[:40]}...")
                         
                         # Отменяем старые ордера
                         cancelled = await self.cancel_old_orders(market_id)
@@ -600,11 +938,14 @@ class MarketMakerBot:
                         
                         # Получаем актуальную информацию о рынке
                         try:
-                            market = await self.client.get_market(market_id)
+                            updated_market = await self.api_client.get_market(market_id)
                             
-                            # Размещаем новые ордера
-                            new_orders = await self.place_limit_orders(market)
-                            self.logger.info(f"  ✅ Placed {len(new_orders)} new orders")
+                            if updated_market:
+                                market_state.market = updated_market
+                                
+                                # Размещаем новые ордера
+                                new_orders = await self.place_limit_orders(updated_market)
+                                self.logger.info(f"  ✅ Placed {len(new_orders)} new orders")
                             
                         except Exception as e:
                             self.logger.error(f"  ❌ Error rebalancing market: {e}")
@@ -635,26 +976,8 @@ class MarketMakerBot:
         self.logger.info(f"  Orders placed:     {self.orders_placed}")
         self.logger.info(f"  Orders filled:     {self.orders_filled}")
         self.logger.info(f"  Orders cancelled:  {self.orders_cancelled}")
-        self.logger.info(f"  Total PnL:         ${self.total_pnl:.2f}")
-        self.logger.info(f"  Points earned:     {self.total_points_earned:.0f} (estimated)")
+        self.logger.info(f"  Active orders:     {sum(1 for o in self.active_orders.values() if o.status == OrderStatus.OPEN)}")
         self.logger.info("=" * 60)
-    
-    async def check_balance(self) -> Optional[Decimal]:
-        """
-        Проверить баланс USDT / Check USDT balance
-        
-        Returns:
-            Balance in USDT or None if error
-        """
-        try:
-            balances = await self.client.get_balances()
-            usdt_balance = Decimal(str(balances.usdt or 0))
-            self.logger.info(f"💰 USDT Balance: ${usdt_balance:.2f}")
-            return usdt_balance
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error checking balance: {e}")
-            return None
     
     async def run(self) -> None:
         """
@@ -665,33 +988,30 @@ class MarketMakerBot:
         self.logger.info("=" * 60)
         self._running = True
         
-        try:
-            # 1. Проверяем баланс / Check balance
-            balance = await self.check_balance()
-            if balance is None or balance < self.config.min_order_size_usd:
-                self.logger.error("❌ Insufficient balance. Please deposit USDT.")
-                return
-            
-            # 2. Получаем подходящие рынки / Get suitable markets
-            markets = await self.get_suitable_markets()
-            if not markets:
-                self.logger.warning("⚠️  No suitable markets found. Check filters or try later.")
-                return
-            
-            # 3. Размещаем начальные ордера / Place initial orders
-            for market in markets[:5]:  # Ограничиваем 5 рынками для начала
-                await self.place_limit_orders(market)
-                await asyncio.sleep(self.config.api_delay_sec)
-            
-            # 4. Запускаем цикл мониторинга / Start monitoring loop
-            await self.monitor_and_rebalance()
-            
-        except KeyboardInterrupt:
-            self.logger.info("⏹️  Received shutdown signal...")
-        except Exception as e:
-            self.logger.error(f"❌ Fatal error: {e}")
-        finally:
-            await self.shutdown()
+        async with self.api_client:
+            try:
+                # 1. Получаем подходящие рынки / Get suitable markets
+                markets = await self.get_suitable_markets()
+                if not markets:
+                    self.logger.warning("⚠️  No suitable markets found. Check filters or try later.")
+                    return
+                
+                # 2. Размещаем начальные ордера / Place initial orders
+                for market in markets[:5]:  # Ограничиваем 5 рынками для начала
+                    await self.place_limit_orders(market)
+                    await asyncio.sleep(self.config.api_delay_sec)
+                
+                # 3. Запускаем цикл мониторинга / Start monitoring loop
+                await self.monitor_and_rebalance()
+                
+            except KeyboardInterrupt:
+                self.logger.info("⏹️  Received shutdown signal...")
+            except Exception as e:
+                self.logger.error(f"❌ Fatal error: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                await self.shutdown()
     
     async def shutdown(self) -> None:
         """
@@ -738,9 +1058,13 @@ def load_config() -> BotConfig:
     if os.getenv("MAX_TOTAL_EXPOSURE_USD"):
         config.max_total_exposure_usd = float(os.getenv("MAX_TOTAL_EXPOSURE_USD"))
     if os.getenv("MARKET_IDS"):
-        config.market_ids = os.getenv("MARKET_IDS", "").split(",")
+        config.market_ids = [m.strip() for m in os.getenv("MARKET_IDS", "").split(",") if m.strip()]
     if os.getenv("LOG_LEVEL"):
         config.log_level = os.getenv("LOG_LEVEL")
+    if os.getenv("PREDICT_ACCOUNT"):
+        config.predict_account = os.getenv("PREDICT_ACCOUNT")
+    if os.getenv("FEE_RATE_BPS"):
+        config.fee_rate_bps = int(os.getenv("FEE_RATE_BPS"))
     
     return config
 
@@ -770,6 +1094,7 @@ async def main():
         print()
         print("📝 Создайте файл .env с содержимым:")
         print("   PRIVATE_KEY=0x...")
+        print("   PREDICT_ACCOUNT=0x... (опционально, адрес Predict Account)")
         print()
         print("   Или введите приватный ключ вручную (НЕ рекомендуется):")
         private_key = input("   Private key: ").strip()

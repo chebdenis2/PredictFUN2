@@ -3,7 +3,7 @@
 
 # Официальный Predict SDK
 # Official Predict SDK: https://github.com/PredictDotFun/sdk-python
-predict-sdk>=0.2.0
+predict-sdk==0.0.12
 
 # Web3 для работы с блокчейном BNB Chain
 # Web3 for BNB Chain blockchain interactions
@@ -12,6 +12,10 @@ web3>=6.0.0
 # Загрузка переменных окружения
 # Environment variables loader
 python-dotenv>=1.0.0
+
+# HTTP клиент для REST API
+# HTTP client for REST API
+aiohttp>=3.9.0
 
 # Асинхронное программирование (входит в стандартную библиотеку Python 3.7+)
 # Async programming (included in Python 3.7+ standard library)
