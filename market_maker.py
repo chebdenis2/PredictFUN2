@@ -1231,40 +1231,35 @@ class MarketMakerBot:
         
         return cancelled
     
-    async def monitor_and_rebalance(self) -> None:
-        """Основной цикл мониторинга"""
-        self.logger.info("🔄 Starting monitor loop...")
-        
-        while self._running:
+    async def _rebalance_existing_markets(self) -> None:
+        """Ребалансировка существующих рынков"""
+        for market_id, state in list(self.markets.items()):
             try:
-                for market_id, state in list(self.markets.items()):
-                    # Проверяем нужна ли ребалансировка
-                    if state.last_rebalance:
-                        elapsed = (datetime.now() - state.last_rebalance).total_seconds()
-                        if elapsed < self.config.rebalance_interval_sec:
-                            continue
-                    
-                    self.logger.info(f"🔄 Rebalancing: {state.market.title[:40]}...")
-                    
-                    # Отменяем старые
-                    await self.cancel_old_orders(market_id)
-                    
-                    # Получаем актуальные данные
-                    updated = await self.graphql_client.get_market(market_id)
-                    if updated and self._is_market_suitable(updated):
-                        state.market = updated
-                        await self.place_limit_orders(updated)
-                    
-                    await asyncio.sleep(self.config.api_delay_sec)
+                # Проверяем нужна ли ребалансировка
+                if state.last_rebalance:
+                    elapsed = (datetime.now() - state.last_rebalance).total_seconds()
+                    if elapsed < self.config.rebalance_interval_sec:
+                        continue
                 
-                self.log_statistics()
-                await asyncio.sleep(self.config.rebalance_interval_sec)
+                self.logger.info(f"🔄 Rebalancing: {state.market.title[:40]}...")
                 
-            except asyncio.CancelledError:
-                break
+                # Отменяем старые
+                await self.cancel_old_orders(market_id)
+                
+                # Получаем актуальные данные
+                updated = await self.graphql_client.get_market(market_id)
+                if updated and self._is_market_suitable(updated):
+                    state.market = updated
+                    await self.place_limit_orders(updated)
+                else:
+                    # Рынок больше не подходит - удаляем
+                    self.logger.info(f"  📤 Market no longer suitable, removing...")
+                    del self.markets[market_id]
+                
+                await asyncio.sleep(self.config.api_delay_sec)
+                
             except Exception as e:
-                self.logger.error(f"❌ Monitor error: {e}")
-                await asyncio.sleep(30)
+                self.logger.error(f"❌ Rebalance error for {market_id}: {e}")
     
     def log_statistics(self) -> None:
         """Логирование статистики"""
@@ -1296,19 +1291,34 @@ class MarketMakerBot:
                     self.logger.error("❌ Failed to login. Cannot place orders.")
                     return
                 
-                # Получаем рынки
-                markets = await self.get_suitable_markets()
-                if not markets:
-                    self.logger.warning("⚠️  No suitable markets found")
-                    return
-                
-                # Размещаем ордера
-                for market in markets[:5]:
-                    await self.place_limit_orders(market)
-                    await asyncio.sleep(self.config.api_delay_sec)
-                
-                # Мониторинг
-                await self.monitor_and_rebalance()
+                # Главный цикл бота
+                while True:
+                    try:
+                        # Получаем рынки
+                        markets = await self.get_suitable_markets()
+                        
+                        if not markets:
+                            self.logger.warning("⚠️  No suitable markets found. Waiting...")
+                            await asyncio.sleep(self.config.rebalance_interval_sec)
+                            continue
+                        
+                        # Размещаем ордера на новых рынках
+                        for market in markets[:5]:
+                            if market.market_id not in self.markets:
+                                await self.place_limit_orders(market)
+                                await asyncio.sleep(self.config.api_delay_sec)
+                        
+                        # Ребалансировка существующих позиций
+                        await self._rebalance_existing_markets()
+                        
+                        self.log_statistics()
+                        await asyncio.sleep(self.config.rebalance_interval_sec)
+                        
+                    except asyncio.CancelledError:
+                        break
+                    except Exception as e:
+                        self.logger.error(f"❌ Main loop error: {e}")
+                        await asyncio.sleep(30)
                 
             except KeyboardInterrupt:
                 self.logger.info("⏹️  Shutdown signal...")
