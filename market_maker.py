@@ -282,26 +282,19 @@ class PredictAPIClient:
         Получить заголовки аутентификации
         Get authentication headers
         
-        Формат может отличаться - проверьте документацию:
-        - X-API-Key / X-Api-Key
-        - Authorization: Bearer <secret>
-        - X-Secret-Key
+        Predict.fun API использует заголовок X-Api-Key
         """
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
         
-        if self.api_key:
-            headers["X-API-Key"] = self.api_key
-            headers["X-Api-Key"] = self.api_key  # Alternative casing
+        # API Key - основной способ аутентификации
+        # Используем api_secret как API Key (это то, что выдаётся индивидуально)
+        api_key = self.api_key or self.api_secret
         
-        if self.api_secret:
-            # Попробуем несколько вариантов заголовков
-            # Try several header variants
-            headers["X-Secret-Key"] = self.api_secret
-            headers["X-API-Secret"] = self.api_secret
-            headers["Authorization"] = f"Bearer {self.api_secret}"
+        if api_key:
+            headers["X-Api-Key"] = api_key
         
         return headers
     
@@ -319,7 +312,12 @@ class PredictAPIClient:
         url = f"{PREDICT_API_V1}{endpoint}"
         headers = self._get_auth_headers()
         
-        self.logger.debug(f"API Request: {method} {url}")
+        # Debug: показываем какой ключ используется (первые/последние символы)
+        api_key = headers.get("X-Api-Key", "")
+        if api_key:
+            self.logger.debug(f"API Request: {method} {url} [Key: {api_key[:8]}...{api_key[-4:]}]")
+        else:
+            self.logger.debug(f"API Request: {method} {url} [No API Key!]")
         
         try:
             async with self.session.request(
@@ -540,8 +538,12 @@ class MarketMakerBot:
             api_secret=config.api_secret
         )
         
-        if config.api_secret:
-            self.logger.info(f"🔐 API Secret configured: {config.api_secret[:8]}...{config.api_secret[-4:]}")
+        # Логируем какой API Key используется
+        effective_key = config.api_key or config.api_secret
+        if effective_key:
+            self.logger.info(f"🔐 API Key configured: {effective_key[:8]}...{effective_key[-4:]}")
+        else:
+            self.logger.warning("⚠️  No API Key configured! API requests may fail.")
         
         # State tracking / Отслеживание состояния
         self.markets: dict[str, MarketState] = {}
