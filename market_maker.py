@@ -923,6 +923,63 @@ class MarketMakerBot:
         """Convert price to wei"""
         return int(price * WEI_MULTIPLIER)
     
+    def _quantity_step(self, price_per_share_wei: int) -> int:
+        """Calculate quantity step for precision (from working bot)"""
+        import math
+        base = 10**13
+        if price_per_share_wei <= 0:
+            return base
+        price_units = price_per_share_wei // base
+        if price_units <= 0:
+            return base
+        step_multiplier = 100000 // math.gcd(price_units, 100000)
+        return base * step_multiplier
+    
+    def _quantize_quantity_wei(self, quantity_wei: int, price_per_share_wei: int) -> int:
+        """Quantize quantity to required precision (from working bot)"""
+        if quantity_wei <= 0:
+            return 0
+        step = self._quantity_step(price_per_share_wei)
+        if step <= 0:
+            return quantity_wei
+        return (quantity_wei // step) * step
+    
+    def _amounts_ok(self, amounts) -> bool:
+        """Check if amounts have valid precision"""
+        maker = int(getattr(amounts, "maker_amount", 0))
+        taker = int(getattr(amounts, "taker_amount", 0))
+        return maker % (10**13) == 0 and taker % (10**13) == 0
+    
+    def _get_valid_amounts(self, side: Side, price_per_share_wei: int, quantity_wei: int):
+        """Get amounts with valid precision, adjusting quantity if needed"""
+        step = self._quantity_step(price_per_share_wei)
+        attempts = 0
+        
+        while quantity_wei > 0:
+            # Quantize quantity first
+            quantized_qty = self._quantize_quantity_wei(quantity_wei, price_per_share_wei)
+            if quantized_qty <= 0:
+                break
+            
+            limit_input = LimitHelperInput(
+                side=side,
+                price_per_share_wei=price_per_share_wei,
+                quantity_wei=quantized_qty
+            )
+            
+            amounts = self.order_builder.get_limit_order_amounts(limit_input)
+            
+            if self._amounts_ok(amounts):
+                return amounts, quantized_qty
+            
+            # Try with smaller quantity
+            quantity_wei -= step
+            attempts += 1
+            if attempts >= 10:
+                break
+        
+        return None, 0
+    
     async def build_and_sign_order(
         self,
         market: MarketData,
@@ -946,13 +1003,12 @@ class MarketMakerBot:
         try:
             price_wei = self.price_to_wei(price)
             
-            limit_input = LimitHelperInput(
-                side=side,
-                price_per_share_wei=price_wei,
-                quantity_wei=quantity_wei
-            )
+            # Get amounts with valid precision (quantized)
+            amounts, quantized_qty = self._get_valid_amounts(side, price_wei, quantity_wei)
             
-            amounts = self.order_builder.get_limit_order_amounts(limit_input)
+            if not amounts or quantized_qty <= 0:
+                self.logger.error(f"    Failed to get valid amounts for qty={quantity_wei}, price={price_wei}")
+                return None
             
             expires_at = datetime.now() + timedelta(minutes=self.config.order_expiry_minutes)
             
