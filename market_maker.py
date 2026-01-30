@@ -472,6 +472,26 @@ class PredictGraphQLClient:
         
         return markets
     
+    async def create_order(self, order_data: dict) -> dict:
+        """
+        Создать ордер через GraphQL mutation
+        Create order via GraphQL mutation
+        """
+        data = await self.execute(CREATE_ORDER_MUTATION, {"data": order_data})
+        return data.get("createOrder", {})
+    
+    async def cancel_order(self, order_hash: str) -> dict:
+        """
+        Отменить ордер через GraphQL mutation
+        Cancel order via GraphQL mutation
+        """
+        try:
+            data = await self.execute(CANCEL_ORDER_MUTATION, {"hash": order_hash})
+            return data.get("cancelOrder", {})
+        except Exception as e:
+            self.logger.warning(f"Cancel order error: {e}")
+            return {}
+    
     async def get_market(self, market_id: str) -> Optional[MarketData]:
         """Получить данные одного рынка / Get single market data"""
         try:
@@ -519,65 +539,27 @@ class PredictGraphQLClient:
 
 
 # ================================================================================
-# REST API CLIENT (FOR ORDERS) / REST API КЛИЕНТ (ДЛЯ ОРДЕРОВ)
+# GraphQL ORDER MUTATIONS
 # ================================================================================
 
-class PredictOrdersClient:
-    """REST API клиент для отправки ордеров"""
-    
-    def __init__(self, logger: logging.Logger, api_key: Optional[str] = None):
-        self.logger = logger
-        self.api_key = api_key
-        self.session: Optional[aiohttp.ClientSession] = None
-    
-    async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
-        return self
-    
-    async def __aexit__(self, *args):
-        if self.session:
-            await self.session.close()
-    
-    def _get_headers(self) -> dict:
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["X-Api-Key"] = self.api_key
-        return headers
-    
-    async def submit_order(self, signed_order: dict) -> dict:
-        """Отправить подписанный ордер / Submit signed order"""
-        if not self.session:
-            self.session = aiohttp.ClientSession()
-        
-        url = f"{PREDICT_API_BASE}/orders"
-        
-        async with self.session.post(
-            url, 
-            json=signed_order, 
-            headers=self._get_headers()
-        ) as response:
-            text = await response.text()
-            
-            if response.status >= 400:
-                self.logger.error(f"Order submit error {response.status}: {text[:500]}")
-                raise Exception(f"Order submit error: {text[:200]}")
-            
-            return json.loads(text)
-    
-    async def cancel_order(self, order_hash: str) -> dict:
-        """Отменить ордер / Cancel order"""
-        if not self.session:
-            self.session = aiohttp.ClientSession()
-        
-        url = f"{PREDICT_API_BASE}/orders/{order_hash}"
-        
-        async with self.session.delete(url, headers=self._get_headers()) as response:
-            text = await response.text()
-            
-            if response.status >= 400:
-                self.logger.warning(f"Order cancel error {response.status}: {text[:200]}")
-            
-            return json.loads(text) if text else {}
+CREATE_ORDER_MUTATION = """
+mutation CreateOrder($data: CreateOrderInput!) {
+  createOrder(data: $data) {
+    id
+    hash
+    status
+  }
+}
+"""
+
+CANCEL_ORDER_MUTATION = """
+mutation CancelOrder($hash: String!) {
+  cancelOrder(hash: $hash) {
+    id
+    status
+  }
+}
+"""
 
 
 # ================================================================================
@@ -621,16 +603,12 @@ class MarketMakerBot:
             options=options
         )
         
-        # API Clients
+        # API Client (GraphQL for everything)
         effective_key = config.api_key or config.api_secret
         self.graphql_client = PredictGraphQLClient(
             logger=self.logger,
             api_key=effective_key,
             timeout_sec=config.graphql_timeout_sec
-        )
-        self.orders_client = PredictOrdersClient(
-            logger=self.logger,
-            api_key=effective_key
         )
         
         if effective_key:
@@ -743,14 +721,15 @@ class MarketMakerBot:
     
     async def build_and_sign_order(
         self,
-        token_id: str,
+        market: MarketData,
+        outcome: OutcomeData,
         side: Side,
         price: Decimal,
         quantity_wei: int,
-        fee_rate_bps: int = 0,
-        is_neg_risk: bool = False
     ) -> Optional[dict]:
-        """Построить и подписать ордер"""
+        """
+        Построить и подписать ордер, вернуть данные для GraphQL mutation
+        """
         try:
             price_wei = self.price_to_wei(price)
             
@@ -766,57 +745,56 @@ class MarketMakerBot:
             
             order_input = BuildOrderInput(
                 side=side,
-                token_id=token_id,
+                token_id=outcome.on_chain_id,
                 maker_amount=str(amounts.maker_amount),
                 taker_amount=str(amounts.taker_amount),
-                fee_rate_bps=str(fee_rate_bps),
+                fee_rate_bps=str(market.maker_fee_bps),
                 expires_at=expires_at
             )
             
             # 1. Build order
-            try:
-                order = self.order_builder.build_order(strategy="LIMIT", data=order_input)
-                self.logger.info(f"    Step 1 OK: Order built, token_id={order.token_id[:20]}...")
-            except Exception as e:
-                self.logger.error(f"    Step 1 FAILED: build_order: {e}")
-                raise
+            order = self.order_builder.build_order(strategy="LIMIT", data=order_input)
+            self.logger.info(f"    Step 1 OK: Order built")
             
             # 2. Build typed data for signing
-            try:
-                typed_data = self.order_builder.build_typed_data(
-                    order,
-                    is_neg_risk=is_neg_risk,
-                    is_yield_bearing=False
-                )
-                self.logger.info(f"    Step 2 OK: TypedData built, type={type(typed_data).__name__}")
-            except Exception as e:
-                self.logger.error(f"    Step 2 FAILED: build_typed_data: {e}")
-                raise
+            typed_data = self.order_builder.build_typed_data(
+                order,
+                is_neg_risk=market.is_neg_risk,
+                is_yield_bearing=False
+            )
+            self.logger.info(f"    Step 2 OK: TypedData built")
             
             # 3. Sign the typed data
-            try:
-                signed_order = self.order_builder.sign_typed_data_order(typed_data)
-                self.logger.info(f"    Step 3 OK: Order signed")
-            except Exception as e:
-                self.logger.error(f"    Step 3 FAILED: sign_typed_data_order: {e}")
-                raise
+            signed_order = self.order_builder.sign_typed_data_order(typed_data)
+            self.logger.info(f"    Step 3 OK: Order signed")
             
+            # 4. Build hash for GraphQL
+            order_hash = self.order_builder.build_typed_data_hash(typed_data)
+            
+            # Format for GraphQL CreateOrderInput
             return {
-                "order": {
-                    "salt": str(order.salt),
-                    "maker": order.maker,
-                    "signer": order.signer,
-                    "taker": order.taker,
-                    "tokenId": str(order.token_id),
-                    "makerAmount": str(order.maker_amount),
-                    "takerAmount": str(order.taker_amount),
-                    "expiration": str(order.expiration),
-                    "nonce": str(order.nonce),
-                    "feeRateBps": str(order.fee_rate_bps),
-                    "side": "BUY" if side == Side.BUY else "SELL",
-                    "signatureType": str(order.signature_type.value if hasattr(order.signature_type, 'value') else order.signature_type),
-                },
+                "hash": order_hash,
+                "amount": str(amounts.taker_amount),  # количество shares
+                "feeRateBps": market.maker_fee_bps,
+                "makerFeeBps": market.maker_fee_bps,
+                "takerFeeBps": market.taker_fee_bps,
+                "marketId": int(market.market_id) if market.market_id.isdigit() else 0,
+                "nonce": int(order.nonce),
+                "priceInCurrency": str(price_wei),
+                "quoteType": False,  # price quote, not amount quote
+                "expiresAt": expires_at.isoformat(),
                 "signature": signed_order.signature,
+                "signatureType": int(order.signature_type.value if hasattr(order.signature_type, 'value') else order.signature_type),
+                "signer": order.signer,
+                "maker": order.maker,
+                "slippageBps": 0,
+                "strategy": "LIMIT",
+                "tokenId": str(outcome.on_chain_id),
+                "salt": str(order.salt),
+                "currency": "USDC",  # или другая валюта
+                "isFillOrKill": False,
+                "takerAmount": str(order.taker_amount),
+                "makerAmount": str(order.maker_amount),
             }
             
         except Exception as e:
@@ -903,24 +881,24 @@ class MarketMakerBot:
         price: Decimal,
         size_wei: int
     ) -> Optional[OrderInfo]:
-        """Разместить один ордер"""
+        """Разместить один ордер через GraphQL"""
         try:
-            signed_order = await self.build_and_sign_order(
-                token_id=outcome.on_chain_id,
+            order_data = await self.build_and_sign_order(
+                market=market,
+                outcome=outcome,
                 side=side,
                 price=price,
                 quantity_wei=size_wei,
-                fee_rate_bps=market.maker_fee_bps,
-                is_neg_risk=market.is_neg_risk
             )
             
-            if not signed_order:
+            if not order_data:
                 return None
             
-            result = await self.orders_client.submit_order(signed_order)
+            # Отправляем через GraphQL
+            result = await self.graphql_client.create_order(order_data)
             
             order_info = OrderInfo(
-                order_hash=result.get("orderHash", ""),
+                order_hash=result.get("hash", order_data.get("hash", "")),
                 market_id=market.market_id,
                 token_id=outcome.on_chain_id,
                 side=side,
@@ -934,7 +912,7 @@ class MarketMakerBot:
             self.active_orders[order_info.order_hash] = order_info
             self.orders_placed += 1
             
-            self.logger.info(f"  ✅ {outcome.name} BUY @ {price:.4f}")
+            self.logger.info(f"  ✅ {outcome.name} {side.name} @ {price:.4f}")
             return order_info
             
         except Exception as e:
@@ -942,7 +920,7 @@ class MarketMakerBot:
             return None
     
     async def cancel_old_orders(self, market_id: Optional[str] = None) -> int:
-        """Отменить старые ордера"""
+        """Отменить старые ордера через GraphQL"""
         cancelled = 0
         
         for order_hash, order in list(self.active_orders.items()):
@@ -952,7 +930,7 @@ class MarketMakerBot:
                 continue
             
             try:
-                await self.orders_client.cancel_order(order_hash)
+                await self.graphql_client.cancel_order(order_hash)
                 order.status = OrderStatus.CANCELLED
                 cancelled += 1
                 self.orders_cancelled += 1
@@ -1016,7 +994,7 @@ class MarketMakerBot:
         self.logger.info("=" * 60)
         self._running = True
         
-        async with self.graphql_client, self.orders_client:
+        async with self.graphql_client:
             try:
                 # Получаем рынки
                 markets = await self.get_suitable_markets()
