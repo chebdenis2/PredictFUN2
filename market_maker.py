@@ -774,20 +774,32 @@ class MarketMakerBot:
             )
             
             # 1. Build order
-            order = self.order_builder.build_order(strategy="LIMIT", data=order_input)
-            self.logger.debug(f"Order built: {type(order)}, token_id={order.token_id}")
+            try:
+                order = self.order_builder.build_order(strategy="LIMIT", data=order_input)
+                self.logger.info(f"    Step 1 OK: Order built, token_id={order.token_id[:20]}...")
+            except Exception as e:
+                self.logger.error(f"    Step 1 FAILED: build_order: {e}")
+                raise
             
             # 2. Build typed data for signing
-            typed_data = self.order_builder.build_typed_data(
-                order,
-                is_neg_risk=is_neg_risk,
-                is_yield_bearing=False
-            )
-            self.logger.debug(f"TypedData built: {type(typed_data)}")
+            try:
+                typed_data = self.order_builder.build_typed_data(
+                    order,
+                    is_neg_risk=is_neg_risk,
+                    is_yield_bearing=False
+                )
+                self.logger.info(f"    Step 2 OK: TypedData built, type={type(typed_data).__name__}")
+            except Exception as e:
+                self.logger.error(f"    Step 2 FAILED: build_typed_data: {e}")
+                raise
             
             # 3. Sign the typed data
-            signed_order = self.order_builder.sign_typed_data_order(typed_data)
-            self.logger.debug(f"Order signed: {type(signed_order)}")
+            try:
+                signed_order = self.order_builder.sign_typed_data_order(typed_data)
+                self.logger.info(f"    Step 3 OK: Order signed")
+            except Exception as e:
+                self.logger.error(f"    Step 3 FAILED: sign_typed_data_order: {e}")
+                raise
             
             return {
                 "order": {
