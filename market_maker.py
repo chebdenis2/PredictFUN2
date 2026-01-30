@@ -810,11 +810,11 @@ class MarketMakerBot:
                     "tokenId": str(order.token_id),
                     "makerAmount": str(order.maker_amount),
                     "takerAmount": str(order.taker_amount),
-                    "expiration": str(int(order.expiration.timestamp())) if order.expiration else "0",
+                    "expiration": str(order.expiration),
                     "nonce": str(order.nonce),
                     "feeRateBps": str(order.fee_rate_bps),
                     "side": "BUY" if side == Side.BUY else "SELL",
-                    "signatureType": str(order.signature_type.value if order.signature_type else 0),
+                    "signatureType": str(order.signature_type.value if hasattr(order.signature_type, 'value') else order.signature_type),
                 },
                 "signature": signed_order.signature,
             }
