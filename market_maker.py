@@ -326,13 +326,21 @@ class PredictAPIClient:
                 json=json_data,
                 headers=headers
             ) as response:
-                data = await response.json()
+                # Сначала читаем текст ответа
+                response_text = await response.text()
                 
                 if response.status >= 400:
-                    self.logger.error(f"API Error {response.status}: {data}")
-                    raise Exception(f"API Error: {data}")
+                    self.logger.error(f"API Error {response.status}: {response_text[:500]}")
+                    raise Exception(f"API Error {response.status}: {response_text[:200]}")
                 
-                return data
+                # Пробуем распарсить как JSON
+                try:
+                    import json
+                    data = json.loads(response_text)
+                    return data
+                except json.JSONDecodeError:
+                    self.logger.error(f"Invalid JSON response: {response_text[:500]}")
+                    raise Exception(f"Invalid JSON: {response_text[:200]}")
                 
         except aiohttp.ClientError as e:
             self.logger.error(f"HTTP Error: {e}")
@@ -340,22 +348,27 @@ class PredictAPIClient:
     
     async def get_markets(
         self, 
-        status: str = "active",
-        limit: int = 100,
-        offset: int = 0
+        status: str = None,
+        limit: int = None,
+        offset: int = None
     ) -> list[MarketData]:
         """
         Получить список рынков / Get list of markets
         
-        GET /api/v1/markets
+        GET /markets
         """
-        params = {
-            "status": status,
-            "limit": limit,
-            "offset": offset
-        }
+        # Собираем только непустые параметры
+        # Only include non-empty parameters
+        params = {}
+        if status:
+            params["status"] = status
+        if limit:
+            params["limit"] = limit
+        if offset:
+            params["offset"] = offset
         
-        data = await self._request("GET", "/markets", params=params)
+        # Если параметры пустые, не передаём их
+        data = await self._request("GET", "/markets", params=params if params else None)
         
         markets = []
         for item in data.get("markets", data.get("data", [])):
@@ -576,8 +589,9 @@ class MarketMakerBot:
         self.logger.info("🔍 Searching for suitable markets...")
         
         try:
-            # Получаем список всех активных рынков через REST API
-            all_markets = await self.api_client.get_markets(status="active", limit=100)
+            # Получаем список всех рынков через REST API
+            # Get all markets via REST API (без фильтров - API сам вернёт активные)
+            all_markets = await self.api_client.get_markets()
             
             suitable = []
             
