@@ -1,0 +1,26 @@
+# Predict.fun Market Maker Bot - Dependencies
+# ===========================================
+
+# Официальный Predict SDK
+# Official Predict SDK: https://github.com/PredictDotFun/sdk-python
+predict-sdk>=0.2.0
+
+# Web3 для работы с блокчейном BNB Chain
+# Web3 for BNB Chain blockchain interactions
+web3>=6.0.0
+
+# Загрузка переменных окружения
+# Environment variables loader
+python-dotenv>=1.0.0
+
+# Асинхронное программирование (входит в стандартную библиотеку Python 3.7+)
+# Async programming (included in Python 3.7+ standard library)
+# asyncio — уже встроен / already built-in
+
+# Опционально: для Telegram уведомлений
+# Optional: for Telegram notifications
+# python-telegram-bot>=20.0
+
+# Опционально: для более продвинутого логирования
+# Optional: for advanced logging
+# loguru>=0.7.0
