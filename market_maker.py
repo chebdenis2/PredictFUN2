@@ -339,12 +339,14 @@ def setup_logging(level: str = "INFO") -> logging.Logger:
 # GRAPHQL CLIENT / GRAPHQL КЛИЕНТ
 # ================================================================================
 
+PREDICT_REST_URL = "https://api.predict.fun"
+
 class PredictGraphQLClient:
     """
     GraphQL клиент для Predict.fun
     
     Использует GraphQL API для получения данных о рынках и категориях.
-    Поддерживает JWT авторизацию для mutations.
+    Использует REST API для авторизации и ордеров.
     """
     
     def __init__(
@@ -360,6 +362,7 @@ class PredictGraphQLClient:
         self.jwt_token: Optional[str] = None  # JWT token for authenticated requests
         
         self.logger.info(f"🌐 GraphQL URL: {PREDICT_GRAPHQL_URL}")
+        self.logger.info(f"🌐 REST URL: {PREDICT_REST_URL}")
     
     async def __aenter__(self):
         timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
@@ -370,15 +373,20 @@ class PredictGraphQLClient:
         if self.session:
             await self.session.close()
     
-    def _get_headers(self) -> dict:
+    def _get_headers(self, require_auth: bool = False) -> dict:
         """Get request headers"""
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0",
+            "Origin": "https://predict.fun",
+            "Referer": "https://predict.fun/",
         }
         if self.api_key:
-            headers["X-Api-Key"] = self.api_key
-        if self.jwt_token:
+            headers["x-api-key"] = self.api_key  # lowercase as in working bot
+        if require_auth or self.jwt_token:
+            if not self.jwt_token:
+                raise Exception("JWT token is required but not set")
             headers["Authorization"] = f"Bearer {self.jwt_token}"
         return headers
     
@@ -477,61 +485,117 @@ class PredictGraphQLClient:
         
         return markets
     
-    async def login(self, address: str, private_key: str) -> bool:
-        """
-        Авторизация через подпись сообщения
-        Login via message signature
+    async def _rest_request(self, method: str, path: str, payload: dict = None) -> dict:
+        """Make REST API request"""
+        if not self.session:
+            timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
+            self.session = aiohttp.ClientSession(timeout=timeout)
         
-        1. Получаем сообщение от API
-        2. Подписываем его
-        3. Отправляем в login mutation
+        url = f"{PREDICT_REST_URL}{path}"
+        headers = self._get_headers(require_auth=False)
+        
+        try:
+            if method == "GET":
+                async with self.session.get(url, headers=headers) as response:
+                    text = await response.text()
+                    if response.status >= 400:
+                        raise Exception(f"REST error {response.status}: {text[:200]}")
+                    return json.loads(text) if text else {}
+            else:
+                async with self.session.post(url, json=payload, headers=headers) as response:
+                    text = await response.text()
+                    if response.status >= 400:
+                        raise Exception(f"REST error {response.status}: {text[:200]}")
+                    return json.loads(text) if text else {}
+        except aiohttp.ClientError as e:
+            raise Exception(f"REST request failed: {e}")
+    
+    async def _rest_request_auth(self, method: str, path: str, payload: dict = None) -> dict:
+        """Make authenticated REST API request"""
+        if not self.session:
+            timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
+            self.session = aiohttp.ClientSession(timeout=timeout)
+        
+        url = f"{PREDICT_REST_URL}{path}"
+        headers = self._get_headers(require_auth=True)
+        
+        try:
+            if method == "GET":
+                async with self.session.get(url, headers=headers) as response:
+                    text = await response.text()
+                    self.logger.info(f"    REST response ({response.status}): {text[:300]}")
+                    if response.status >= 400:
+                        raise Exception(f"REST error {response.status}: {text[:200]}")
+                    return json.loads(text) if text else {}
+            else:
+                async with self.session.post(url, json=payload, headers=headers) as response:
+                    text = await response.text()
+                    self.logger.info(f"    REST response ({response.status}): {text[:300]}")
+                    if response.status >= 400:
+                        raise Exception(f"REST error {response.status}: {text[:200]}")
+                    return json.loads(text) if text else {}
+        except aiohttp.ClientError as e:
+            raise Exception(f"REST request failed: {e}")
+    
+    async def login_rest(self, predict_account: str, order_builder) -> bool:
+        """
+        Авторизация через REST API (как в рабочем боте)
+        Login via REST API
+        
+        1. GET /v1/auth/message - получаем сообщение
+        2. Подписываем через sign_predict_account_message()
+        3. POST /v1/auth - получаем JWT token
+        
+        Args:
+            predict_account: Predict Account address (smart wallet)
+            order_builder: OrderBuilder instance for signing
         
         Returns:
             True if login successful
         """
         try:
-            from eth_account import Account
-            from eth_account.messages import encode_defunct
+            # 1. Получаем сообщение
+            self.logger.info("📝 Getting auth message from REST API...")
+            msg_response = await self._rest_request("GET", "/v1/auth/message")
             
-            # 1. Получаем timestamp в миллисекундах
-            timestamp_ms = int(datetime.now().timestamp() * 1000)
-            
-            # 2. Получаем сообщение от API
-            msg_data = await self.execute(GET_LOGIN_MESSAGE_QUERY, {"timestamp": timestamp_ms})
-            message = msg_data.get("message")
-            
-            if not message:
-                self.logger.error("Failed to get login message from API")
+            if not msg_response.get("success"):
+                self.logger.error(f"Failed to get auth message: {msg_response}")
                 return False
             
-            self.logger.info(f"📝 Got login message, signing...")
+            message = msg_response.get("data", {}).get("message")
+            if not message:
+                self.logger.error(f"No message in response: {msg_response}")
+                return False
             
-            # 3. Подписываем сообщение
-            account = Account.from_key(private_key)
-            message_encoded = encode_defunct(text=message)
-            signed = account.sign_message(message_encoded)
-            signature = signed.signature.hex()
+            self.logger.info(f"📝 Got message, signing with Predict Account...")
+            
+            # 2. Подписываем через SDK (sign_predict_account_message)
+            signature = order_builder.sign_predict_account_message(message)
             if not signature.startswith("0x"):
                 signature = "0x" + signature
             
-            # 4. Отправляем login mutation
-            data = await self.execute(LOGIN_MUTATION, {
-                "data": {
-                    "address": address,
-                    "message": message,
-                    "signature": signature
-                }
-            })
+            self.logger.info(f"✍️ Signature: {signature[:20]}...")
             
-            auth = data.get("login", {}).get("auth", {})
-            token = auth.get("token")
+            # 3. POST /v1/auth
+            auth_payload = {
+                "signer": predict_account,  # Predict Account address, not Privy wallet!
+                "message": message,
+                "signature": signature,
+            }
             
+            auth_response = await self._rest_request("POST", "/v1/auth", auth_payload)
+            
+            if not auth_response.get("success"):
+                self.logger.error(f"Auth failed: {auth_response}")
+                return False
+            
+            token = auth_response.get("data", {}).get("token")
             if token:
                 self.jwt_token = token
-                self.logger.info(f"🔐 Logged in successfully!")
+                self.logger.info(f"🔐 Logged in successfully via REST!")
                 return True
             else:
-                self.logger.error(f"Login failed: no token in response. Data: {data}")
+                self.logger.error(f"No token in auth response: {auth_response}")
                 return False
                 
         except Exception as e:
@@ -540,52 +604,61 @@ class PredictGraphQLClient:
             self.logger.error(traceback.format_exc())
             return False
     
-    async def create_order(self, order_data: dict) -> dict:
+    async def create_order_rest(self, order_payload: dict) -> dict:
         """
-        Создать ордер через GraphQL mutation
-        Create order via GraphQL mutation
+        Создать ордер через REST API (как в рабочем боте)
+        Create order via REST API
+        
+        Args:
+            order_payload: Full payload with "data" key containing order info
+        
+        Returns:
+            Order response dict
         """
-        # Проверяем что JWT токен есть
         if not self.jwt_token:
             self.logger.error("    No JWT token! Please login first.")
             raise Exception("Not authenticated")
         
-        self.logger.info(f"    JWT token present: {self.jwt_token[:20]}...")
+        self.logger.info(f"    Submitting order to REST API /v1/orders...")
+        self.logger.info(f"    JWT token: {self.jwt_token[:30]}...")
         
-        data = await self.execute(CREATE_ORDER_MUTATION, {"data": order_data})
-        self.logger.info(f"    GraphQL response: {data}")
-        
-        result = data.get("createOrder", {})
-        if result is None:
-            return {}
-        
-        order = result.get("order") if isinstance(result, dict) else None
-        code = result.get("code") if isinstance(result, dict) else None
-        
-        if order:
-            self.logger.info(f"    ✅ Order created: id={order.get('id')}")
-            return order
-        
-        if code:
-            self.logger.error(f"    ❌ Order failed with code: {code}")
-            raise Exception(f"Order failed: {code}")
-        
-        return result if isinstance(result, dict) else {}
+        try:
+            response = await self._rest_request_auth("POST", "/v1/orders", order_payload)
+            
+            if response.get("success"):
+                order_data = response.get("data", {})
+                self.logger.info(f"    ✅ Order created: {order_data.get('id', 'unknown')}")
+                return order_data
+            else:
+                self.logger.error(f"    ❌ Order failed: {response}")
+                raise Exception(f"Order failed: {response.get('message', 'Unknown error')}")
+                
+        except Exception as e:
+            self.logger.error(f"    REST order error: {e}")
+            raise
     
-    async def cancel_order(self, order_id: str) -> bool:
+    async def cancel_orders_rest(self, order_ids: list[str]) -> bool:
         """
-        Отменить ордер через GraphQL mutation
-        Cancel order via GraphQL mutation
+        Отменить ордера через REST API
+        Cancel orders via REST API
         
         Args:
-            order_id: ID ордера (не hash!)
+            order_ids: List of order IDs to cancel
         """
+        if not order_ids:
+            return True
+            
         try:
-            data = await self.execute(CANCEL_ORDER_MUTATION, {"data": {"ids": [order_id]}})
-            return data.get("cancelOrder", False)
+            payload = {"data": {"ids": order_ids}}
+            response = await self._rest_request_auth("POST", "/v1/orders/remove", payload)
+            return response.get("success", False)
         except Exception as e:
-            self.logger.warning(f"Cancel order error: {e}")
+            self.logger.warning(f"Cancel orders error: {e}")
             return False
+    
+    async def cancel_order(self, order_id: str) -> bool:
+        """Cancel single order via REST API"""
+        return await self.cancel_orders_rest([order_id])
     
     async def get_market(self, market_id: str) -> Optional[MarketData]:
         """Получить данные одного рынка / Get single market data"""
@@ -843,7 +916,16 @@ class MarketMakerBot:
         quantity_wei: int,
     ) -> Optional[dict]:
         """
-        Построить и подписать ордер, вернуть данные для GraphQL mutation
+        Построить и подписать ордер, вернуть payload для REST API
+        
+        Format (как в рабочем боте):
+        {
+            "data": {
+                "order": {...signed order fields...},
+                "pricePerShare": str(price_per_share_wei),
+                "strategy": "LIMIT"
+            }
+        }
         """
         try:
             price_wei = self.price_to_wei(price)
@@ -886,33 +968,30 @@ class MarketMakerBot:
             # 4. Build hash
             order_hash = self.order_builder.build_typed_data_hash(typed_data)
             
-            # GraphQL CreateOrderInput format (flat structure)
-            # market_id is a numeric string like "392"
-            market_id_int = int(market.market_id) if market.market_id.isdigit() else 0
+            # REST API payload format (как в рабочем боте)
+            order_payload = {
+                "hash": order_hash,
+                "salt": str(signed_order.salt),
+                "maker": signed_order.maker,
+                "signer": signed_order.signer,
+                "taker": signed_order.taker,
+                "tokenId": str(signed_order.token_id),
+                "makerAmount": str(signed_order.maker_amount),
+                "takerAmount": str(signed_order.taker_amount),
+                "expiration": str(signed_order.expiration),
+                "nonce": str(signed_order.nonce),
+                "feeRateBps": str(signed_order.fee_rate_bps),
+                "side": int(signed_order.side.value if hasattr(signed_order.side, 'value') else signed_order.side),
+                "signatureType": int(signed_order.signature_type.value if hasattr(signed_order.signature_type, 'value') else signed_order.signature_type),
+                "signature": signed_order.signature,
+            }
             
             return {
-                "hash": order_hash,
-                "amount": str(amounts.taker_amount),
-                "feeRateBps": market.maker_fee_bps,
-                "makerFeeBps": market.maker_fee_bps,
-                "takerFeeBps": market.taker_fee_bps,
-                "marketId": market_id_int,
-                "nonce": int(signed_order.nonce),
-                "priceInCurrency": str(amounts.price_per_share),
-                "quoteType": False,
-                "expiresAt": expires_at.isoformat(),
-                "signature": signed_order.signature,
-                "signatureType": int(signed_order.signature_type.value if hasattr(signed_order.signature_type, 'value') else signed_order.signature_type),
-                "signer": signed_order.signer,
-                "maker": signed_order.maker,
-                "slippageBps": 0,
-                "strategy": "LIMIT",
-                "tokenId": str(signed_order.token_id),
-                "salt": str(signed_order.salt),
-                "currency": "USDT",
-                "isFillOrKill": False,
-                "takerAmount": str(signed_order.taker_amount),
-                "makerAmount": str(signed_order.maker_amount),
+                "data": {
+                    "order": order_payload,
+                    "pricePerShare": str(amounts.price_per_share),
+                    "strategy": "LIMIT",
+                }
             }
             
         except Exception as e:
@@ -999,9 +1078,9 @@ class MarketMakerBot:
         price: Decimal,
         size_wei: int
     ) -> Optional[OrderInfo]:
-        """Разместить один ордер через GraphQL"""
+        """Разместить один ордер через REST API"""
         try:
-            order_data = await self.build_and_sign_order(
+            order_payload = await self.build_and_sign_order(
                 market=market,
                 outcome=outcome,
                 side=side,
@@ -1009,19 +1088,20 @@ class MarketMakerBot:
                 quantity_wei=size_wei,
             )
             
-            if not order_data:
+            if not order_payload:
                 return None
             
-            # Отправляем через GraphQL
-            result = await self.graphql_client.create_order(order_data)
+            # Извлекаем hash из payload для логирования
+            order_hash = order_payload.get("data", {}).get("order", {}).get("hash", "")
             
-            if not result or not result.get("id"):
-                self.logger.warning(f"    Order created but no ID returned")
-                # Всё равно считаем успехом если нет ошибки
+            # Отправляем через REST API
+            result = await self.graphql_client.create_order_rest(order_payload)
+            
+            order_id = result.get("id", "") if result else ""
             
             order_info = OrderInfo(
-                order_id=result.get("id", ""),
-                order_hash=result.get("hash", order_data.get("hash", "")),
+                order_id=order_id,
+                order_hash=result.get("hash", order_hash),
                 market_id=market.market_id,
                 token_id=outcome.on_chain_id,
                 side=side,
@@ -1125,10 +1205,13 @@ class MarketMakerBot:
         
         async with self.graphql_client:
             try:
-                # Авторизуемся используя адрес Privy wallet (подписывающего)
-                # НЕ Predict Account, а именно wallet address
-                login_address = self.address  # Privy wallet, не smart wallet
-                logged_in = await self.graphql_client.login(login_address, self._private_key)
+                # Авторизуемся через REST API с Predict Account
+                # signer = Predict Account address (smart wallet)
+                # signature = sign_predict_account_message() от SDK
+                logged_in = await self.graphql_client.login_rest(
+                    predict_account=self.predict_account,
+                    order_builder=self.order_builder
+                )
                 if not logged_in:
                     self.logger.error("❌ Failed to login. Cannot place orders.")
                     return
