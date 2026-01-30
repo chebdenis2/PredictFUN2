@@ -1,0 +1,65 @@
+Ты — senior blockchain-разработчик с опытом работы на BNB Chain, предсказательными рынками (Predict.fun, Polymarket и аналогами) и создания торговых ботов / market-making скриптов. Ты знаешь официальный Predict SDK (TypeScript и Python версии доступны на GitHub: PredictDotFun/sdk-python и @predictdotfun/sdk), ethers v6, web3.py, asyncio. Твои ответы всегда содержат чистый, безопасный, хорошо прокомментированный код + подробные объяснения. Никогда не придумывай несуществующие API — опирайся на реальную документацию Predict API (dev.predict.fun) и SDK по состоянию на январь 2026.
+
+Задача: Напиши полный рабочий Python-скрипт (на базе predict-sdk), который реализует стратегию **предоставления ликвидности через лимит-ордера** (market making) на Predict.fun для фарма Predict Points.
+
+Основные требования к скрипту:
+- Использует официальный Python SDK: pip install predict-sdk
+- Поддерживает Predict Account (smart wallet) — большинство пользователей используют именно его
+- Выбирает рынки автоматически или по списку (фильтры: низкий OI < $15k, вероятность 40–60%, новая/экзотическая категория)
+- Размещает лимит-ордера с обеих сторон (YES и NO) с tight spread (например, ±0.02–0.04 от mid-price)
+- Поддерживает delta-neutral: примерно равный объём на YES и NO, чтобы минимизировать PnL-риск
+- Мониторит orderbook, переставляет ордера при изменении цены (rebalancing каждые 5–30 минут)
+- Логирует все действия, PnL, начисленные поинты (если API позволяет читать)
+- Обрабатывает ошибки, газ, nonce, rate-limits
+- Имеет конфиг (API ключи не нужны, но private key / privy signer для Predict Account)
+- Безопасность: никогда не хардкодить приватные ключи, использовать .env или input()
+- Опционально: отменяет старые ордера перед размещением новых, проверяет баланс USDT
+
+Обязательная структура ответа:
+
+1. Введение
+   - Кратко объяснить, что делает скрипт, какие поинты он фармит (liquidity provision, 2x multiplier в uncertain markets)
+   - Предупреждения: риски (исполнение в минус, газ, изменение правил платформы, анти-сибил), это не финансовая рекомендация, тестировать на малых суммах
+
+2. Требования и установка
+   - pip install predict-sdk python-dotenv asyncio web3
+   - Как получить Predict Account address и signer (из настроек predict.fun/account/settings)
+   - Где взять privy wallet private key (если нужно)
+
+3. Конфигурация (пример config)
+   - Переменные: CHAIN = ChainId.BnbMainnet
+   - PRIVATE_KEY или PREDICT_ACCOUNT
+   - MIN_OI, MAX_OI, TARGET_SPREAD, ORDER_SIZE_USD, REBALANCE_INTERVAL_SEC и т.д.
+   - Список market_ids для старта (или логика автопоиска через REST API /markets)
+
+4. Полный код скрипта
+   - Импорты
+   - Класс MarketMakerBot с методами:
+     - __init__ (инициализация SDK, signer)
+     - get_suitable_markets() — фильтр рынков
+     - get_mid_price_and_amounts(market) — расчёт mid, bid/ask prices, amounts
+     - place_limit_orders(market) — размещение bid + ask
+     - monitor_and_rebalance() — основной цикл (asyncio)
+     - cancel_old_orders() — опционально
+     - run()
+   - async main() с asyncio.run()
+
+5. Пример использования
+   - Как запустить: python market_maker.py
+   - Как остановить (Ctrl+C graceful shutdown)
+
+6. Возможные улучшения (в комментариях или отдельно)
+   - Интеграция с Telegram-уведомлениями
+   - Авто-выбор рынков по API
+   - Расчёт ожидаемых поинтов
+   - Обработка yield-bearing collateral (если включено)
+
+7. Риски и disclaimers (ещё раз)
+   - Потеря средств при сильных движениях
+   - Правила Predict.fun могут запретить ботов / автоматизацию
+   - Анти-сибил: не злоупотреблять, не много аккаунтов
+   - Проверь актуальную документацию: https://dev.predict.fun/ и https://github.com/PredictDotFun/sdk-python
+
+Код должен быть максимально чистым, с type hints где возможно, подробными комментариями на русском и английском. Если какой-то метод SDK изменился — используй ближайший аналог по документации (buildOrder, getLimitOrderAmounts, signAndSubmit и т.п.). Если нужно читать orderbook — используй REST API или SDK методы.
+
+Сделай скрипт **готовым к тесту** на малом капитале ($100–500), но масштабируемым.
