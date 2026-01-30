@@ -747,7 +747,8 @@ class MarketMakerBot:
         side: Side,
         price: Decimal,
         quantity_wei: int,
-        fee_rate_bps: int = 0
+        fee_rate_bps: int = 0,
+        is_neg_risk: bool = False
     ) -> Optional[dict]:
         """Построить и подписать ордер"""
         try:
@@ -772,8 +773,18 @@ class MarketMakerBot:
                 expires_at=expires_at
             )
             
+            # 1. Build order
             order = self.order_builder.build_order(strategy="LIMIT", data=order_input)
-            signed_order = self.order_builder.sign_typed_data_order(order)
+            
+            # 2. Build typed data for signing
+            typed_data = self.order_builder.build_typed_data(
+                order,
+                is_neg_risk=is_neg_risk,
+                is_yield_bearing=False
+            )
+            
+            # 3. Sign the typed data
+            signed_order = self.order_builder.sign_typed_data_order(typed_data)
             
             return {
                 "order": {
@@ -795,6 +806,8 @@ class MarketMakerBot:
             
         except Exception as e:
             self.logger.error(f"❌ Error building order: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     async def place_limit_orders(self, market: MarketData) -> list[OrderInfo]:
@@ -882,7 +895,8 @@ class MarketMakerBot:
                 side=side,
                 price=price,
                 quantity_wei=size_wei,
-                fee_rate_bps=market.maker_fee_bps
+                fee_rate_bps=market.maker_fee_bps,
+                is_neg_risk=market.is_neg_risk
             )
             
             if not signed_order:
