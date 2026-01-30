@@ -766,8 +766,8 @@ class MarketMakerBot:
             order_input = BuildOrderInput(
                 side=side,
                 token_id=token_id,
-                maker_amount=str(amounts.maker),
-                taker_amount=str(amounts.taker),
+                maker_amount=str(amounts.maker_amount),
+                taker_amount=str(amounts.taker_amount),
                 fee_rate_bps=str(fee_rate_bps),
                 expires_at=expires_at
             )
@@ -803,25 +803,26 @@ class MarketMakerBot:
         placed_orders = []
         
         try:
-            # Находим YES и NO outcomes
-            yes_outcome = None
-            no_outcome = None
+            # Находим outcomes по индексу (index 0 и 1)
+            # Для бинарных рынков: index 0 = первый исход, index 1 = второй исход
+            # Для YES/NO рынков: обычно YES=0, NO=1
+            outcomes_by_index = {o.index: o for o in market.outcomes}
             
-            for outcome in market.outcomes:
-                if outcome.name.upper() in ["YES", "TRUE", "OVER"]:
-                    yes_outcome = outcome
-                elif outcome.name.upper() in ["NO", "FALSE", "UNDER"]:
-                    no_outcome = outcome
-                elif outcome.index == 0:
-                    yes_outcome = outcome
-                elif outcome.index == 1:
-                    no_outcome = outcome
+            outcome_0 = outcomes_by_index.get(0)
+            outcome_1 = outcomes_by_index.get(1)
             
-            if not yes_outcome or not no_outcome:
-                self.logger.warning(f"  ⚠️  Cannot identify YES/NO outcomes")
-                return []
+            if not outcome_0 or not outcome_1:
+                # Попробуем просто взять первые два outcome
+                if len(market.outcomes) >= 2:
+                    outcome_0 = market.outcomes[0]
+                    outcome_1 = market.outcomes[1]
+                else:
+                    self.logger.warning(f"  ⚠️  Need at least 2 outcomes, got {len(market.outcomes)}")
+                    return []
             
-            # Рассчитываем mid price
+            self.logger.info(f"  🎯 Outcomes: [{outcome_0.name}] vs [{outcome_1.name}]")
+            
+            # Рассчитываем mid price из chancePercentage (вероятность первого исхода)
             mid_price = Decimal(str(market.chance_percentage / 100.0))
             bid_price, ask_price, bid_size_wei, ask_size_wei = self.calculate_order_params(mid_price)
             
@@ -829,24 +830,29 @@ class MarketMakerBot:
                 f"  📊 Mid: {mid_price:.4f} | Bid: {bid_price:.4f} | Ask: {ask_price:.4f}"
             )
             
-            # Размещаем ордер на YES
-            if yes_outcome.on_chain_id:
+            # Размещаем ордер на первый исход (outcome_0)
+            if outcome_0.on_chain_id:
                 order = await self._place_single_order(
-                    market, yes_outcome, Side.BUY, bid_price, bid_size_wei
+                    market, outcome_0, Side.BUY, bid_price, bid_size_wei
                 )
                 if order:
                     placed_orders.append(order)
+            else:
+                self.logger.warning(f"  ⚠️  {outcome_0.name} has no on_chain_id")
             
             await asyncio.sleep(self.config.api_delay_sec)
             
-            # Размещаем ордер на NO (delta-neutral)
-            if no_outcome.on_chain_id:
-                no_bid_price = max(Decimal("0.01"), min(Decimal("0.99"), Decimal("1") - ask_price))
+            # Размещаем ордер на второй исход (outcome_1) для delta-neutral
+            if outcome_1.on_chain_id:
+                # Цена второго исхода = 1 - цена первого
+                outcome_1_price = max(Decimal("0.01"), min(Decimal("0.99"), Decimal("1") - ask_price))
                 order = await self._place_single_order(
-                    market, no_outcome, Side.BUY, no_bid_price, ask_size_wei
+                    market, outcome_1, Side.BUY, outcome_1_price, ask_size_wei
                 )
                 if order:
                     placed_orders.append(order)
+            else:
+                self.logger.warning(f"  ⚠️  {outcome_1.name} has no on_chain_id")
             
             # Обновляем состояние
             if market.market_id not in self.markets:
