@@ -775,6 +775,7 @@ class MarketMakerBot:
             
             # 1. Build order
             order = self.order_builder.build_order(strategy="LIMIT", data=order_input)
+            self.logger.debug(f"Order built: {type(order)}, token_id={order.token_id}")
             
             # 2. Build typed data for signing
             typed_data = self.order_builder.build_typed_data(
@@ -782,9 +783,11 @@ class MarketMakerBot:
                 is_neg_risk=is_neg_risk,
                 is_yield_bearing=False
             )
+            self.logger.debug(f"TypedData built: {type(typed_data)}")
             
             # 3. Sign the typed data
             signed_order = self.order_builder.sign_typed_data_order(typed_data)
+            self.logger.debug(f"Order signed: {type(signed_order)}")
             
             return {
                 "order": {
@@ -807,7 +810,7 @@ class MarketMakerBot:
         except Exception as e:
             self.logger.error(f"❌ Error building order: {e}")
             import traceback
-            traceback.print_exc()
+            self.logger.error(traceback.format_exc())
             return None
     
     async def place_limit_orders(self, market: MarketData) -> list[OrderInfo]:
