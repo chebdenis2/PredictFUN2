@@ -797,7 +797,7 @@ class MarketMakerBot:
                 "strategy": "LIMIT",
                 "tokenId": str(outcome.on_chain_id),
                 "salt": str(order.salt),
-                "currency": "USDC",  # или другая валюта
+                "currency": "USDT",
                 "isFillOrKill": False,
                 "takerAmount": str(order.taker_amount),
                 "makerAmount": str(order.maker_amount),
