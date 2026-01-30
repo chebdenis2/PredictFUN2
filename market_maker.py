@@ -284,7 +284,8 @@ class MarketData:
 @dataclass
 class OrderInfo:
     """Информация об ордере"""
-    order_hash: str
+    order_id: str       # ID ордера из GraphQL (для отмены)
+    order_hash: str     # Hash ордера
     market_id: str
     token_id: str
     side: Side
@@ -478,19 +479,24 @@ class PredictGraphQLClient:
         Create order via GraphQL mutation
         """
         data = await self.execute(CREATE_ORDER_MUTATION, {"data": order_data})
-        return data.get("createOrder", {})
+        result = data.get("createOrder", {})
+        # Возвращаем order если есть, иначе весь результат
+        return result.get("order", result) if isinstance(result, dict) else {}
     
-    async def cancel_order(self, order_hash: str) -> dict:
+    async def cancel_order(self, order_id: str) -> bool:
         """
         Отменить ордер через GraphQL mutation
         Cancel order via GraphQL mutation
+        
+        Args:
+            order_id: ID ордера (не hash!)
         """
         try:
-            data = await self.execute(CANCEL_ORDER_MUTATION, {"hash": order_hash})
-            return data.get("cancelOrder", {})
+            data = await self.execute(CANCEL_ORDER_MUTATION, {"data": {"ids": [order_id]}})
+            return data.get("cancelOrder", False)
         except Exception as e:
             self.logger.warning(f"Cancel order error: {e}")
-            return {}
+            return False
     
     async def get_market(self, market_id: str) -> Optional[MarketData]:
         """Получить данные одного рынка / Get single market data"""
@@ -545,19 +551,19 @@ class PredictGraphQLClient:
 CREATE_ORDER_MUTATION = """
 mutation CreateOrder($data: CreateOrderInput!) {
   createOrder(data: $data) {
-    id
-    hash
-    status
+    order {
+      id
+      hash
+      status
+    }
+    code
   }
 }
 """
 
 CANCEL_ORDER_MUTATION = """
-mutation CancelOrder($hash: String!) {
-  cancelOrder(hash: $hash) {
-    id
-    status
-  }
+mutation CancelOrder($data: CancelOrderInput!) {
+  cancelOrder(data: $data)
 }
 """
 
@@ -898,6 +904,7 @@ class MarketMakerBot:
             result = await self.graphql_client.create_order(order_data)
             
             order_info = OrderInfo(
+                order_id=result.get("id", ""),
                 order_hash=result.get("hash", order_data.get("hash", "")),
                 market_id=market.market_id,
                 token_id=outcome.on_chain_id,
@@ -909,7 +916,9 @@ class MarketMakerBot:
                 expires_at=datetime.now() + timedelta(minutes=self.config.order_expiry_minutes)
             )
             
-            self.active_orders[order_info.order_hash] = order_info
+            # Используем order_id как ключ
+            key = order_info.order_id or order_info.order_hash
+            self.active_orders[key] = order_info
             self.orders_placed += 1
             
             self.logger.info(f"  ✅ {outcome.name} {side.name} @ {price:.4f}")
@@ -923,18 +932,22 @@ class MarketMakerBot:
         """Отменить старые ордера через GraphQL"""
         cancelled = 0
         
-        for order_hash, order in list(self.active_orders.items()):
+        for key, order in list(self.active_orders.items()):
             if market_id and order.market_id != market_id:
                 continue
             if order.status != OrderStatus.OPEN:
                 continue
             
             try:
-                await self.graphql_client.cancel_order(order_hash)
-                order.status = OrderStatus.CANCELLED
-                cancelled += 1
-                self.orders_cancelled += 1
-                self.logger.info(f"  🗑️  Cancelled: {order_hash[:16]}...")
+                # Используем order_id для отмены
+                cancel_id = order.order_id or order.order_hash
+                if cancel_id:
+                    success = await self.graphql_client.cancel_order(cancel_id)
+                    if success:
+                        order.status = OrderStatus.CANCELLED
+                        cancelled += 1
+                        self.orders_cancelled += 1
+                        self.logger.info(f"  🗑️  Cancelled: {cancel_id[:16]}...")
             except Exception as e:
                 self.logger.warning(f"  ⚠️  Cancel failed: {e}")
             
