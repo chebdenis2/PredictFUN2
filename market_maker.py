@@ -80,10 +80,12 @@ except ImportError:
 # ================================================================================
 
 # Predict.fun REST API
-PREDICT_API_BASE = "https://api.predict.fun"
+PREDICT_API_MAINNET = "https://api.predict.fun"
+PREDICT_API_TESTNET = "https://api-testnet.predict.fun"
 
-# API endpoints - без /api/v1 prefix
-# API endpoints - without /api/v1 prefix
+# По умолчанию mainnet, но можно переключить через .env
+# Default mainnet, can switch via .env
+PREDICT_API_BASE = PREDICT_API_MAINNET
 
 # Wei conversion (18 decimals for most tokens)
 WEI_DECIMALS = 18
@@ -143,6 +145,9 @@ class BotConfig:
     # API Authentication
     api_key: Optional[str] = None        # API Key (if required)
     api_secret: Optional[str] = None     # API Secret Key (индивидуально выдаётся)
+    
+    # API Environment (mainnet or testnet)
+    use_testnet: bool = False            # True = testnet, False = mainnet
     
     # Logging
     log_level: str = "INFO"
@@ -261,12 +266,17 @@ class PredictAPIClient:
         self, 
         logger: logging.Logger,
         api_key: Optional[str] = None,
-        api_secret: Optional[str] = None
+        api_secret: Optional[str] = None,
+        use_testnet: bool = False
     ):
         self.logger = logger
         self.api_key = api_key
         self.api_secret = api_secret
+        self.use_testnet = use_testnet
+        self.base_url = PREDICT_API_TESTNET if use_testnet else PREDICT_API_MAINNET
         self.session: Optional[aiohttp.ClientSession] = None
+        
+        self.logger.info(f"🌐 API Base URL: {self.base_url}")
     
     async def __aenter__(self):
         self.session = aiohttp.ClientSession()
@@ -308,7 +318,7 @@ class PredictAPIClient:
         if not self.session:
             self.session = aiohttp.ClientSession()
         
-        url = f"{PREDICT_API_BASE}{endpoint}"
+        url = f"{self.base_url}{endpoint}"
         headers = self._get_auth_headers()
         
         # Debug: показываем какой ключ используется (первые/последние символы)
@@ -547,7 +557,8 @@ class MarketMakerBot:
         self.api_client = PredictAPIClient(
             logger=self.logger,
             api_key=config.api_key,
-            api_secret=config.api_secret
+            api_secret=config.api_secret,
+            use_testnet=config.use_testnet
         )
         
         # Логируем какой API Key используется
@@ -1138,6 +1149,10 @@ def load_config() -> BotConfig:
         config.api_key = os.getenv("API_KEY")
     if os.getenv("API_SECRET") or os.getenv("API_SECRET_KEY"):
         config.api_secret = os.getenv("API_SECRET") or os.getenv("API_SECRET_KEY")
+    
+    # API Environment
+    if os.getenv("USE_TESTNET", "").lower() in ("true", "1", "yes"):
+        config.use_testnet = True
     
     return config
 
