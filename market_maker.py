@@ -81,10 +81,9 @@ except ImportError:
 
 # Predict.fun REST API
 PREDICT_API_BASE = "https://api.predict.fun"
-PREDICT_API_V1 = f"{PREDICT_API_BASE}/api/v1"
 
-# Alternative API endpoints (check docs for correct one)
-PREDICT_API_GRAPHQL = f"{PREDICT_API_BASE}/graphql"
+# API endpoints - без /api/v1 prefix
+# API endpoints - without /api/v1 prefix
 
 # Wei conversion (18 decimals for most tokens)
 WEI_DECIMALS = 18
@@ -309,7 +308,7 @@ class PredictAPIClient:
         if not self.session:
             self.session = aiohttp.ClientSession()
         
-        url = f"{PREDICT_API_V1}{endpoint}"
+        url = f"{PREDICT_API_BASE}{endpoint}"
         headers = self._get_auth_headers()
         
         # Debug: показываем какой ключ используется (первые/последние символы)
