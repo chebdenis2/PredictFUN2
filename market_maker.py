@@ -120,6 +120,7 @@ query GetCategoryMarkets($categoryId: ID!, $first: Int!) {
     id
     title
     isNegRisk
+    isYieldBearing
     markets(pagination: {first: $first}) {
       edges {
         node {
@@ -183,6 +184,7 @@ query GetMarket($marketId: ID!) {
     category {
       id
       isNegRisk
+      isYieldBearing
     }
   }
 }
@@ -278,6 +280,7 @@ class MarketData:
     volume_24h_usd: Decimal
     outcomes: list[OutcomeData]
     is_neg_risk: bool = False
+    is_yield_bearing: bool = False
     category_id: Optional[str] = None
 
 
@@ -445,6 +448,7 @@ class PredictGraphQLClient:
         
         category = data.get("category", {})
         is_neg_risk = category.get("isNegRisk", False)
+        is_yield_bearing = category.get("isYieldBearing", False)
         
         markets = []
         edges = category.get("markets", {}).get("edges", [])
@@ -480,6 +484,7 @@ class PredictGraphQLClient:
                 volume_24h_usd=Decimal(str(stats.get("volume24hUsd") or 0)),
                 outcomes=outcomes,
                 is_neg_risk=is_neg_risk,
+                is_yield_bearing=is_yield_bearing,
                 category_id=category_id,
             ))
         
@@ -698,6 +703,7 @@ class PredictGraphQLClient:
                 volume_24h_usd=Decimal(str(stats.get("volume24hUsd") or 0)),
                 outcomes=outcomes,
                 is_neg_risk=category.get("isNegRisk", False),
+                is_yield_bearing=category.get("isYieldBearing", False),
                 category_id=category.get("id"),
             )
             
@@ -958,10 +964,13 @@ class MarketMakerBot:
             self.logger.info(f"    Step 1 OK: Order built")
             
             # 2. Build typed data for signing
+            # Log signature params for debugging
+            self.logger.info(f"    Signature params: is_neg_risk={market.is_neg_risk}, is_yield_bearing={market.is_yield_bearing}")
+            
             typed_data = self.order_builder.build_typed_data(
                 order,
                 is_neg_risk=market.is_neg_risk,
-                is_yield_bearing=False
+                is_yield_bearing=market.is_yield_bearing
             )
             self.logger.info(f"    Step 2 OK: TypedData built")
             
