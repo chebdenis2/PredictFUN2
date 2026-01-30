@@ -344,6 +344,7 @@ class PredictGraphQLClient:
     GraphQL клиент для Predict.fun
     
     Использует GraphQL API для получения данных о рынках и категориях.
+    Поддерживает JWT авторизацию для mutations.
     """
     
     def __init__(
@@ -356,6 +357,7 @@ class PredictGraphQLClient:
         self.api_key = api_key
         self.timeout_sec = timeout_sec
         self.session: Optional[aiohttp.ClientSession] = None
+        self.jwt_token: Optional[str] = None  # JWT token for authenticated requests
         
         self.logger.info(f"🌐 GraphQL URL: {PREDICT_GRAPHQL_URL}")
     
@@ -376,6 +378,8 @@ class PredictGraphQLClient:
         }
         if self.api_key:
             headers["X-Api-Key"] = self.api_key
+        if self.jwt_token:
+            headers["Authorization"] = f"Bearer {self.jwt_token}"
         return headers
     
     async def execute(self, query: str, variables: dict = None) -> dict:
@@ -472,6 +476,56 @@ class PredictGraphQLClient:
             ))
         
         return markets
+    
+    async def login(self, address: str, private_key: str) -> bool:
+        """
+        Авторизация через подпись сообщения
+        Login via message signature
+        
+        Returns:
+            True if login successful
+        """
+        try:
+            from eth_account import Account
+            from eth_account.messages import encode_defunct
+            
+            # Создаём сообщение для подписи
+            timestamp = int(datetime.now().timestamp())
+            message = f"Sign in to Predict.fun\n\nTimestamp: {timestamp}"
+            
+            # Подписываем сообщение
+            account = Account.from_key(private_key)
+            message_encoded = encode_defunct(text=message)
+            signed = account.sign_message(message_encoded)
+            signature = signed.signature.hex()
+            if not signature.startswith("0x"):
+                signature = "0x" + signature
+            
+            # Отправляем login mutation
+            data = await self.execute(LOGIN_MUTATION, {
+                "data": {
+                    "address": address,
+                    "message": message,
+                    "signature": signature
+                }
+            })
+            
+            auth = data.get("login", {}).get("auth", {})
+            token = auth.get("token")
+            
+            if token:
+                self.jwt_token = token
+                self.logger.info(f"🔐 Logged in successfully, token received")
+                return True
+            else:
+                self.logger.error(f"Login failed: no token in response")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Login error: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return False
     
     async def create_order(self, order_data: dict) -> dict:
         """
@@ -579,6 +633,17 @@ mutation CancelOrder($data: CancelOrderInput!) {
 }
 """
 
+LOGIN_MUTATION = """
+mutation Login($data: AccountLoginInput!) {
+  login(data: $data) {
+    auth {
+      address
+      token
+    }
+  }
+}
+"""
+
 
 # ================================================================================
 # MARKET MAKER BOT / MARKET MAKING БОТ
@@ -628,6 +693,9 @@ class MarketMakerBot:
             api_key=effective_key,
             timeout_sec=config.graphql_timeout_sec
         )
+        
+        # Store private key for login
+        self._private_key = private_key
         
         if effective_key:
             self.logger.info(f"🔐 API Key: {effective_key[:8]}...{effective_key[-4:]}")
@@ -1025,6 +1093,13 @@ class MarketMakerBot:
         
         async with self.graphql_client:
             try:
+                # Авторизуемся
+                login_address = self.predict_account or self.address
+                logged_in = await self.graphql_client.login(login_address, self._private_key)
+                if not logged_in:
+                    self.logger.error("❌ Failed to login. Cannot place orders.")
+                    return
+                
                 # Получаем рынки
                 markets = await self.get_suitable_markets()
                 if not markets:
