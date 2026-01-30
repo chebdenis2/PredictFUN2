@@ -940,12 +940,16 @@ class MarketMakerBot:
             
             expires_at = datetime.now() + timedelta(minutes=self.config.order_expiry_minutes)
             
+            # Fee rate must be at least 200 bps (2%) per API requirement
+            fee_rate = max(market.taker_fee_bps, market.maker_fee_bps, 200)
+            self.logger.info(f"    Fee rate: {fee_rate} bps (market: maker={market.maker_fee_bps}, taker={market.taker_fee_bps})")
+            
             order_input = BuildOrderInput(
                 side=side,
                 token_id=outcome.on_chain_id,
                 maker_amount=str(amounts.maker_amount),
                 taker_amount=str(amounts.taker_amount),
-                fee_rate_bps=str(market.maker_fee_bps),
+                fee_rate_bps=str(fee_rate),
                 expires_at=expires_at
             )
             
