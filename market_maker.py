@@ -1112,8 +1112,9 @@ class MarketMakerBot:
         
         async with self.graphql_client:
             try:
-                # Авторизуемся
-                login_address = self.predict_account or self.address
+                # Авторизуемся используя адрес Privy wallet (подписывающего)
+                # НЕ Predict Account, а именно wallet address
+                login_address = self.address  # Privy wallet, не smart wallet
                 logged_in = await self.graphql_client.login(login_address, self._private_key)
                 if not logged_in:
                     self.logger.error("❌ Failed to login. Cannot place orders.")
