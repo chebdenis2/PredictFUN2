@@ -479,9 +479,21 @@ class PredictGraphQLClient:
         Create order via GraphQL mutation
         """
         data = await self.execute(CREATE_ORDER_MUTATION, {"data": order_data})
+        self.logger.info(f"    GraphQL response: {data}")
+        
         result = data.get("createOrder", {})
+        if result is None:
+            self.logger.warning("    createOrder returned None")
+            return {}
+        
         # Возвращаем order если есть, иначе весь результат
-        return result.get("order", result) if isinstance(result, dict) else {}
+        order = result.get("order") if isinstance(result, dict) else None
+        if order:
+            self.logger.info(f"    ✅ Order created: id={order.get('id')}, status={order.get('status')}")
+            return order
+        
+        self.logger.warning(f"    No order in response, code={result.get('code') if isinstance(result, dict) else result}")
+        return result if isinstance(result, dict) else {}
     
     async def cancel_order(self, order_id: str) -> bool:
         """
@@ -902,6 +914,10 @@ class MarketMakerBot:
             
             # Отправляем через GraphQL
             result = await self.graphql_client.create_order(order_data)
+            
+            if not result or not result.get("id"):
+                self.logger.warning(f"    Order created but no ID returned")
+                # Всё равно считаем успехом если нет ошибки
             
             order_info = OrderInfo(
                 order_id=result.get("id", ""),
