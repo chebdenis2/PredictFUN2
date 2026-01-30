@@ -632,7 +632,10 @@ class PredictGraphQLClient:
             
             if response.get("success"):
                 order_data = response.get("data", {})
-                self.logger.info(f"    ✅ Order created: {order_data.get('id', 'unknown')}")
+                order_id = order_data.get("orderId", order_data.get("id", "unknown"))
+                self.logger.info(f"    ✅ Order created: {order_id}")
+                # Normalize the response to have 'id' key
+                order_data["id"] = order_id
                 return order_data
             else:
                 self.logger.error(f"    ❌ Order failed: {response}")
@@ -648,13 +651,20 @@ class PredictGraphQLClient:
         Cancel orders via REST API
         
         Args:
-            order_ids: List of order IDs to cancel
+            order_ids: List of order IDs (numeric, not hashes!) to cancel
         """
         if not order_ids:
             return True
+        
+        # Filter out empty strings and hashes (API expects numeric IDs)
+        valid_ids = [oid for oid in order_ids if oid and not oid.startswith("0x")]
+        if not valid_ids:
+            self.logger.warning(f"    No valid order IDs to cancel (got: {order_ids})")
+            return False
             
         try:
-            payload = {"data": {"ids": order_ids}}
+            self.logger.info(f"    Cancelling orders: {valid_ids}")
+            payload = {"data": {"ids": valid_ids}}
             response = await self._rest_request_auth("POST", "/v1/orders/remove", payload)
             return response.get("success", False)
         except Exception as e:
@@ -1111,10 +1121,11 @@ class MarketMakerBot:
             result = await self.graphql_client.create_order_rest(order_payload)
             
             order_id = result.get("id", "") if result else ""
+            result_hash = result.get("orderHash", result.get("hash", order_hash)) if result else order_hash
             
             order_info = OrderInfo(
                 order_id=order_id,
-                order_hash=result.get("hash", order_hash),
+                order_hash=result_hash,
                 market_id=market.market_id,
                 token_id=outcome.on_chain_id,
                 side=side,
