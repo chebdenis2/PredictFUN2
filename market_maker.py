@@ -1108,9 +1108,15 @@ class MarketMakerBot:
             mid_price = Decimal(str(market.chance_percentage / 100.0))
             bid_price, ask_price, bid_size_wei, ask_size_wei = self.calculate_order_params(mid_price)
             
-            self.logger.info(
-                f"  📊 Mid: {mid_price:.4f} | Bid: {bid_price:.4f} | Ask: {ask_price:.4f}"
-            )
+            # Delta-neutral цена для второго исхода
+            outcome_1_price = max(Decimal("0.01"), min(Decimal("0.99"), Decimal("1") - ask_price))
+            
+            self.logger.info(f"  📊 DELTA-NEUTRAL STRATEGY:")
+            self.logger.info(f"     Mid price: {mid_price:.4f} (from probability {market.chance_percentage:.0f}%)")
+            self.logger.info(f"     Spread: {self.config.target_spread:.2%}")
+            self.logger.info(f"     {outcome_0.name}: BUY @ {bid_price:.4f} (mid - spread)")
+            self.logger.info(f"     {outcome_1.name}: BUY @ {outcome_1_price:.4f} (1 - ask = 1 - {ask_price:.4f})")
+            self.logger.info(f"     Order size: ${self.config.order_size_usd:.2f} each side")
             
             # Размещаем ордер на первый исход (outcome_0)
             if outcome_0.on_chain_id:
@@ -1126,8 +1132,6 @@ class MarketMakerBot:
             
             # Размещаем ордер на второй исход (outcome_1) для delta-neutral
             if outcome_1.on_chain_id:
-                # Цена второго исхода = 1 - цена первого
-                outcome_1_price = max(Decimal("0.01"), min(Decimal("0.99"), Decimal("1") - ask_price))
                 order = await self._place_single_order(
                     market, outcome_1, Side.BUY, outcome_1_price, ask_size_wei
                 )
@@ -1370,6 +1374,12 @@ def load_config() -> BotConfig:
         config.api_key = os.getenv("API_KEY")
     if os.getenv("API_SECRET") or os.getenv("API_SECRET_KEY"):
         config.api_secret = os.getenv("API_SECRET") or os.getenv("API_SECRET_KEY")
+    if os.getenv("MIN_PROB_PERCENT"):
+        config.min_probability = float(os.getenv("MIN_PROB_PERCENT")) / 100.0
+    if os.getenv("MAX_PROB_PERCENT"):
+        config.max_probability = float(os.getenv("MAX_PROB_PERCENT")) / 100.0
+    if os.getenv("ORDER_EXPIRY_MINUTES"):
+        config.order_expiry_minutes = int(os.getenv("ORDER_EXPIRY_MINUTES"))
     
     return config
 
