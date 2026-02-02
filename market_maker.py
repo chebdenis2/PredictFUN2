@@ -222,6 +222,9 @@ class BotConfig:
     max_market_hold_minutes: int = 60    # Максимум минут на одном рынке (0 = без лимита)
     min_time_to_expiry_minutes: int = 30 # Не входить если до экспирации < X минут
     
+    # Position recovery / Восстановление позиций
+    recover_positions_on_start: bool = True  # Восстанавливать позиции при старте
+    
     # Order settings / Настройки ордеров
     target_spread: float = 0.03          # Целевой спред от mid-price (±3%)
     order_size_usd: float = 25.0         # Размер каждого ордера в USD
@@ -673,6 +676,34 @@ class PredictGraphQLClient:
         except Exception as e:
             self.logger.error(f"    REST order error: {e}")
             raise
+    
+    async def get_positions(self) -> list[dict]:
+        """
+        Получить открытые позиции через REST API
+        GET /v1/positions
+        """
+        try:
+            response = await self._rest_request_auth("GET", "/v1/positions")
+            if response.get("success"):
+                return response.get("data", [])
+            return []
+        except Exception as e:
+            self.logger.warning(f"Failed to get positions: {e}")
+            return []
+    
+    async def get_open_orders(self, status: str = "OPEN") -> list[dict]:
+        """
+        Получить ордера через REST API
+        GET /v1/orders?status=OPEN
+        """
+        try:
+            response = await self._rest_request_auth("GET", f"/v1/orders?status={status}")
+            if response.get("success"):
+                return response.get("data", [])
+            return []
+        except Exception as e:
+            self.logger.warning(f"Failed to get orders: {e}")
+            return []
     
     async def cancel_orders_rest(self, order_ids: list[str]) -> bool:
         """
@@ -1389,6 +1420,150 @@ class MarketMakerBot:
             except Exception as e:
                 self.logger.error(f"❌ Rebalance error for {market_id}: {e}")
     
+    async def _recover_positions(self) -> None:
+        """
+        Восстановить позиции при перезапуске бота
+        
+        1. Получить открытые позиции
+        2. Найти незахеджированные (только одна сторона)
+        3. Попробовать закрыть delta-neutral:
+           - По рынку если убыток < порога
+           - Лимиткой если убыток > порога
+        """
+        self.logger.info("🔍 Recovering existing positions...")
+        
+        try:
+            positions = await self.graphql_client.get_positions()
+            
+            if not positions:
+                self.logger.info("  ✅ No existing positions found")
+                return
+            
+            self.logger.info(f"  📊 Found {len(positions)} position(s)")
+            
+            # Группируем позиции по market_id (conditionId)
+            positions_by_market: dict[str, list[dict]] = {}
+            for pos in positions:
+                market_id = pos.get("marketId") or pos.get("market", {}).get("id", "")
+                if market_id:
+                    if market_id not in positions_by_market:
+                        positions_by_market[market_id] = []
+                    positions_by_market[market_id].append(pos)
+            
+            for market_id, market_positions in positions_by_market.items():
+                await self._analyze_and_hedge_position(market_id, market_positions)
+                await asyncio.sleep(self.config.api_delay_sec)
+            
+            self.logger.info("  ✅ Position recovery complete")
+            
+        except Exception as e:
+            self.logger.error(f"❌ Position recovery error: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+    
+    async def _analyze_and_hedge_position(self, market_id: str, positions: list[dict]) -> None:
+        """
+        Анализировать позицию и захеджировать если нужно
+        """
+        try:
+            # Получаем данные рынка
+            market = await self.graphql_client.get_market(market_id)
+            if not market:
+                self.logger.warning(f"  ⚠️  Market {market_id} not found")
+                return
+            
+            self.logger.info(f"  📈 Analyzing: {market.title[:40]}...")
+            
+            # Определяем какие стороны у нас есть
+            # position обычно содержит: tokenId, quantity, side, entryPrice и т.д.
+            outcome_positions = {}
+            for pos in positions:
+                token_id = pos.get("tokenId", "")
+                quantity = float(pos.get("quantity", 0) or pos.get("size", 0) or 0)
+                if token_id and quantity > 0:
+                    outcome_positions[token_id] = {
+                        "quantity": quantity,
+                        "entry_price": float(pos.get("entryPrice", 0) or pos.get("avgPrice", 0) or 0),
+                        "token_id": token_id
+                    }
+            
+            if len(outcome_positions) == 0:
+                self.logger.info(f"    No active positions")
+                return
+            
+            if len(outcome_positions) >= 2:
+                self.logger.info(f"    ✅ Already delta-neutral (both sides)")
+                return
+            
+            # Только одна сторона - нужно захеджировать
+            filled_token_id = list(outcome_positions.keys())[0]
+            filled_pos = outcome_positions[filled_token_id]
+            
+            self.logger.info(f"    ⚠️  UNHEDGED position: token={filled_token_id[:20]}...")
+            self.logger.info(f"    Entry price: {filled_pos['entry_price']:.4f}, Qty: {filled_pos['quantity']:.4f}")
+            
+            # Находим противоположный outcome
+            other_outcome = None
+            for outcome in market.outcomes:
+                if outcome.on_chain_id != filled_token_id:
+                    other_outcome = outcome
+                    break
+            
+            if not other_outcome:
+                self.logger.warning(f"    ❌ Could not find opposite outcome")
+                return
+            
+            # Текущая рыночная цена другой стороны (ask price)
+            market_price = float(other_outcome.ask_price) if other_outcome.ask_price else 0.5
+            
+            # Рассчитываем убыток при рыночном входе
+            filled_price = Decimal(str(filled_pos['entry_price']))
+            loss_percent = self._calculate_market_entry_loss(filled_price, Decimal(str(market_price)))
+            
+            self.logger.info(f"    Opposite side: {other_outcome.name} @ {market_price:.4f} (ask)")
+            self.logger.info(f"    Calculated loss if market entry: {loss_percent:.2f}%")
+            
+            if loss_percent <= self.config.max_market_loss_percent:
+                # Входим по рынку
+                self.logger.info(f"    ✅ Loss acceptable, entering at MARKET price")
+                # Размер = количество первой позиции * цена (чтобы суммы совпали)
+                size_usd = filled_pos['quantity'] * filled_pos['entry_price']
+                size_wei = int(Decimal(str(size_usd / market_price)) * WEI_MULTIPLIER)
+                
+                order = await self._place_single_order(
+                    market=market,
+                    outcome=other_outcome,
+                    side=Side.BUY,
+                    price=Decimal(str(market_price)),  # По текущей цене
+                    size_wei=size_wei
+                )
+                if order:
+                    self.logger.info(f"    ✅ Hedge order placed!")
+            else:
+                # Ставим лимитку
+                # Рассчитываем цену лимитки чтобы общий убыток был <= порога
+                # filled_price + limit_price <= 1 + max_loss%
+                max_limit_price = 1.0 + (self.config.max_market_loss_percent / 100) - float(filled_price)
+                limit_price = Decimal(str(max(0.01, min(0.99, max_limit_price))))
+                
+                self.logger.info(f"    📝 Loss too high, placing LIMIT @ {limit_price:.4f}")
+                
+                size_usd = filled_pos['quantity'] * filled_pos['entry_price']
+                size_wei = int(Decimal(str(size_usd / float(limit_price))) * WEI_MULTIPLIER)
+                
+                order = await self._place_single_order(
+                    market=market,
+                    outcome=other_outcome,
+                    side=Side.BUY,
+                    price=limit_price,
+                    size_wei=size_wei
+                )
+                if order:
+                    self.logger.info(f"    ✅ Hedge limit order placed!")
+            
+        except Exception as e:
+            self.logger.error(f"    ❌ Hedge error: {e}")
+    
     def log_statistics(self) -> None:
         """Логирование статистики"""
         self.logger.info("=" * 60)
@@ -1414,6 +1589,7 @@ class MarketMakerBot:
         self.logger.info(f"  Market fallback: {'ON' if self.config.enable_market_fallback else 'OFF'}")
         if self.config.enable_market_fallback:
             self.logger.info(f"  Max market loss: {self.config.max_market_loss_percent:.1f}%")
+        self.logger.info(f"  Position recovery: {'ON' if self.config.recover_positions_on_start else 'OFF'}")
         self.logger.info("=" * 60)
     
     async def run(self) -> None:
@@ -1436,6 +1612,12 @@ class MarketMakerBot:
                 if not logged_in:
                     self.logger.error("❌ Failed to login. Cannot place orders.")
                     return
+                
+                # Восстанавливаем позиции после перезапуска
+                if self.config.recover_positions_on_start:
+                    await self._recover_positions()
+                else:
+                    self.logger.info("⏭️  Position recovery disabled")
                 
                 # Главный цикл бота
                 while True:
@@ -1532,6 +1714,8 @@ def load_config() -> BotConfig:
         config.max_market_hold_minutes = int(os.getenv("MAX_MARKET_HOLD_MINUTES"))
     if os.getenv("MIN_TIME_TO_EXPIRY_MINUTES"):
         config.min_time_to_expiry_minutes = int(os.getenv("MIN_TIME_TO_EXPIRY_MINUTES"))
+    if os.getenv("RECOVER_POSITIONS"):
+        config.recover_positions_on_start = os.getenv("RECOVER_POSITIONS", "").lower() in ("true", "1", "yes")
     
     return config
 
