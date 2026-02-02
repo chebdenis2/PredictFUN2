@@ -326,6 +326,7 @@ class MarketState:
     position_usd: float = 0.0  # Текущий размер позиции в USD
     filled_outcome_0: bool = False  # Сработал ли ордер на первый исход
     filled_outcome_1: bool = False  # Сработал ли ордер на второй исход
+    has_unhedged_position: bool = False  # Есть незахеджированная позиция (только hedge ордера)
 
 
 # ================================================================================
@@ -1186,8 +1187,13 @@ class MarketMakerBot:
         placed_orders = []
         
         try:
-            # Проверяем лимит позиции
+            # Проверяем есть ли незахеджированная позиция (тогда нужен только hedge, не лимитки)
             state = self.markets.get(market.market_id)
+            if state and state.has_unhedged_position:
+                self.logger.info(f"  ⏭️  Skipping: market has unhedged position (hedge only)")
+                return []
+            
+            # Проверяем лимит позиции
             current_position = state.position_usd if state else 0.0
             
             if current_position >= self.config.max_position_usd:
@@ -1437,6 +1443,9 @@ class MarketMakerBot:
             
             # Если 2+ сторон - уже delta-neutral, можно размещать обычные лимитки
             if len(outcome_positions) >= 2:
+                # Сбрасываем флаг unhedged если был установлен
+                if market_id in self.markets and self.markets[market_id].has_unhedged_position:
+                    self.markets[market_id].has_unhedged_position = False
                 return False
             
             # Если 1 сторона - нужен hedge
@@ -1861,6 +1870,17 @@ class MarketMakerBot:
                 if market_id in self.markets:
                     self.markets[market_id].filled_outcome_0 = True
                     self.markets[market_id].filled_outcome_1 = True
+                    self.markets[market_id].has_unhedged_position = False  # Сбрасываем флаг
+                else:
+                    # Добавляем в tracking как delta-neutral
+                    self.markets[market_id] = MarketState(
+                        market=market,
+                        entered_at=datetime.now(),
+                        last_rebalance=datetime.now(),
+                        filled_outcome_0=True,
+                        filled_outcome_1=True,
+                        has_unhedged_position=False
+                    )
                 return
             
             # Только одна сторона - нужно захеджировать
@@ -1943,6 +1963,14 @@ class MarketMakerBot:
                 )
                 if order:
                     self.logger.info(f"    ✅ Hedge MARKET order placed for ${size_usd:.2f}!")
+                    # ВАЖНО: добавляем рынок в tracking чтобы не размещать дубли
+                    if market_id not in self.markets:
+                        self.markets[market_id] = MarketState(
+                            market=market,
+                            entered_at=datetime.now(),
+                            last_rebalance=datetime.now(),
+                            has_unhedged_position=True  # Флаг что есть незахеджированная позиция
+                        )
             else:
                 # Ставим лимитку - убыток слишком большой
                 # Рассчитываем цену лимитки: filled_price + limit_price <= 1 + max_loss%
@@ -1969,6 +1997,14 @@ class MarketMakerBot:
                 )
                 if order:
                     self.logger.info(f"    ✅ Hedge LIMIT order placed for ${size_usd:.2f}!")
+                    # ВАЖНО: добавляем рынок в tracking чтобы не размещать дубли
+                    if market_id not in self.markets:
+                        self.markets[market_id] = MarketState(
+                            market=market,
+                            entered_at=datetime.now(),
+                            last_rebalance=datetime.now(),
+                            has_unhedged_position=True
+                        )
             
         except Exception as e:
             self.logger.error(f"    ❌ Hedge error: {e}")
