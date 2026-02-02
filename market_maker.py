@@ -1661,6 +1661,7 @@ class MarketMakerBot:
                 )
                 
                 # Получаем количество (shares) - много возможных названий
+                # ВАЖНО: amount обычно в wei (10^18), нужно конвертировать
                 quantity_raw = (
                     pos.get("shares") or 
                     pos.get("quantity") or 
@@ -1671,6 +1672,9 @@ class MarketMakerBot:
                 )
                 try:
                     quantity = float(str(quantity_raw).replace(",", "."))
+                    # Если количество очень большое (> 10^15), скорее всего это wei
+                    if quantity > 1e15:
+                        quantity = quantity / WEI_MULTIPLIER
                 except (ValueError, TypeError):
                     quantity = 0
                 
@@ -1690,6 +1694,10 @@ class MarketMakerBot:
                         avg_price = avg_price / 100.0
                 except (ValueError, TypeError):
                     avg_price = 0
+                
+                # Если avgPrice не найден, но есть valueUsd и quantity - вычисляем
+                if avg_price == 0 and quantity > 0 and value_usd > 0:
+                    avg_price = value_usd / quantity
                 
                 # Получаем USD value
                 value_usd_raw = pos.get("valueUsd") or pos.get("value") or pos.get("totalValue") or 0
@@ -1778,12 +1786,21 @@ class MarketMakerBot:
             self.logger.info(f"    Hedge target: {other_outcome.name} @ ${market_price:.4f} (ask)")
             self.logger.info(f"    Entry + Market = ${float(filled_price) + market_price:.4f} | Loss: {loss_percent:.2f}%")
             
+            # Минимальный размер ордера на Predict.fun = $0.9
+            MIN_ORDER_VALUE_USD = 0.9
+            
             if loss_percent <= self.config.max_market_loss_percent:
                 # Входим по рынку - убыток приемлемый
                 self.logger.info(f"    ✅ Loss {loss_percent:.2f}% <= {self.config.max_market_loss_percent}%, entering at MARKET")
                 
                 # Размер = стоимость первой позиции, чтобы суммы были равны
                 size_usd = filled_pos['value_usd'] if filled_pos['value_usd'] > 0 else (filled_pos['quantity'] * filled_pos['entry_price'])
+                
+                # Проверяем минимальный размер ордера
+                if size_usd < MIN_ORDER_VALUE_USD:
+                    self.logger.warning(f"    ⚠️  Position value ${size_usd:.2f} < min ${MIN_ORDER_VALUE_USD} - skipping hedge")
+                    return
+                
                 size_wei = int(Decimal(str(size_usd / market_price)) * WEI_MULTIPLIER)
                 
                 order = await self._place_single_order(
@@ -1804,6 +1821,12 @@ class MarketMakerBot:
                 self.logger.info(f"    📝 Loss {loss_percent:.2f}% > {self.config.max_market_loss_percent}%, placing LIMIT @ ${float(limit_price):.4f}")
                 
                 size_usd = filled_pos['value_usd'] if filled_pos['value_usd'] > 0 else (filled_pos['quantity'] * filled_pos['entry_price'])
+                
+                # Проверяем минимальный размер ордера
+                if size_usd < MIN_ORDER_VALUE_USD:
+                    self.logger.warning(f"    ⚠️  Position value ${size_usd:.2f} < min ${MIN_ORDER_VALUE_USD} - skipping hedge")
+                    return
+                
                 size_wei = int(Decimal(str(size_usd / float(limit_price))) * WEI_MULTIPLIER)
                 
                 order = await self._place_single_order(
