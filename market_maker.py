@@ -210,6 +210,13 @@ class BotConfig:
     min_probability: float = 0.40        # Минимальная вероятность (40%)
     max_probability: float = 0.60        # Максимальная вероятность (60%) — "uncertain markets" 2x
     
+    # Position limits / Лимиты позиций
+    max_position_usd: float = 50.0       # Максимум $ на одну позицию
+    
+    # Market order fallback / Рыночный ордер для delta-neutral
+    enable_market_fallback: bool = True  # Разрешить рыночные ордера для delta-neutral
+    max_market_loss_percent: float = 2.0 # Макс. убыток % для рыночного входа (если больше — оставить лимитку)
+    
     # Order settings / Настройки ордеров
     target_spread: float = 0.03          # Целевой спред от mid-price (±3%)
     order_size_usd: float = 25.0         # Размер каждого ордера в USD
@@ -305,6 +312,10 @@ class MarketState:
     market: MarketData
     our_orders: list[OrderInfo] = field(default_factory=list)
     last_rebalance: Optional[datetime] = None
+    # Position tracking
+    position_usd: float = 0.0  # Текущий размер позиции в USD
+    filled_outcome_0: bool = False  # Сработал ли ордер на первый исход
+    filled_outcome_1: bool = False  # Сработал ли ордер на второй исход
 
 
 # ================================================================================
@@ -1085,16 +1096,29 @@ class MarketMakerBot:
         placed_orders = []
         
         try:
+            # Проверяем лимит позиции
+            state = self.markets.get(market.market_id)
+            current_position = state.position_usd if state else 0.0
+            
+            if current_position >= self.config.max_position_usd:
+                self.logger.info(f"  ⚠️  Position limit reached: ${current_position:.2f} >= ${self.config.max_position_usd:.2f}")
+                return []
+            
+            # Сколько ещё можем вложить
+            remaining_budget = self.config.max_position_usd - current_position
+            order_size = min(self.config.order_size_usd, remaining_budget / 2)  # /2 т.к. 2 ордера
+            
+            if order_size < 1.0:  # Минимум $1
+                self.logger.info(f"  ⚠️  Remaining budget too small: ${remaining_budget:.2f}")
+                return []
+            
             # Находим outcomes по индексу (index 0 и 1)
-            # Для бинарных рынков: index 0 = первый исход, index 1 = второй исход
-            # Для YES/NO рынков: обычно YES=0, NO=1
             outcomes_by_index = {o.index: o for o in market.outcomes}
             
             outcome_0 = outcomes_by_index.get(0)
             outcome_1 = outcomes_by_index.get(1)
             
             if not outcome_0 or not outcome_1:
-                # Попробуем просто взять первые два outcome
                 if len(market.outcomes) >= 2:
                     outcome_0 = market.outcomes[0]
                     outcome_1 = market.outcomes[1]
@@ -1103,10 +1127,18 @@ class MarketMakerBot:
                     return []
             
             self.logger.info(f"  🎯 Outcomes: [{outcome_0.name}] vs [{outcome_1.name}]")
+            self.logger.info(f"  💰 Position: ${current_position:.2f} / ${self.config.max_position_usd:.2f} (order: ${order_size:.2f})")
             
-            # Рассчитываем mid price из chancePercentage (вероятность первого исхода)
+            # Рассчитываем mid price из chancePercentage
             mid_price = Decimal(str(market.chance_percentage / 100.0))
-            bid_price, ask_price, bid_size_wei, ask_size_wei = self.calculate_order_params(mid_price)
+            
+            # Пересчитываем размеры с учётом лимита
+            spread = Decimal(str(self.config.target_spread))
+            bid_price = max(Decimal("0.01"), min(Decimal("0.99"), mid_price - spread))
+            ask_price = max(Decimal("0.01"), min(Decimal("0.99"), mid_price + spread))
+            
+            bid_size_wei = int((Decimal(str(order_size)) / bid_price) * WEI_MULTIPLIER)
+            ask_size_wei = int((Decimal(str(order_size)) / ask_price) * WEI_MULTIPLIER)
             
             # Delta-neutral цена для второго исхода
             outcome_1_price = max(Decimal("0.01"), min(Decimal("0.99"), Decimal("1") - ask_price))
@@ -1235,6 +1267,46 @@ class MarketMakerBot:
         
         return cancelled
     
+    def _calculate_market_entry_loss(
+        self, 
+        filled_price: Decimal, 
+        market_price: Decimal
+    ) -> float:
+        """
+        Рассчитать убыток при рыночном входе для delta-neutral
+        
+        Если одна сторона куплена по filled_price, а вторую берём по market_price:
+        Total cost = filled_price + market_price
+        Guaranteed payout = 1.00
+        Loss = (total_cost - 1.0) / 1.0 * 100%
+        """
+        total_cost = float(filled_price) + float(market_price)
+        if total_cost <= 1.0:
+            return 0.0  # Нет убытка, есть профит
+        return (total_cost - 1.0) * 100  # Убыток в %
+    
+    async def _check_and_handle_partial_fills(self, market_id: str, state: MarketState) -> None:
+        """
+        Проверить частичное исполнение и при необходимости войти по рынку
+        
+        Если включен market_fallback и одна сторона исполнилась:
+        1. Получить текущую рыночную цену другой стороны
+        2. Рассчитать убыток при рыночном входе
+        3. Если убыток <= max_market_loss_percent, войти по рынку
+        4. Иначе оставить лимитку
+        """
+        if not self.config.enable_market_fallback:
+            return
+        
+        # TODO: Для полной реализации нужно:
+        # 1. Запросить статус ордеров через REST API GET /v1/orders
+        # 2. Определить какая сторона исполнилась
+        # 3. Получить текущий orderbook для рыночной цены
+        # 4. Выполнить market order если выгодно
+        #
+        # Пока это placeholder для будущей реализации
+        pass
+    
     async def _rebalance_existing_markets(self) -> None:
         """Ребалансировка существующих рынков"""
         for market_id, state in list(self.markets.items()):
@@ -1246,6 +1318,9 @@ class MarketMakerBot:
                         continue
                 
                 self.logger.info(f"🔄 Rebalancing: {state.market.title[:40]}...")
+                
+                # Проверяем частичное исполнение (market fallback)
+                await self._check_and_handle_partial_fills(market_id, state)
                 
                 # Отменяем старые
                 await self.cancel_old_orders(market_id)
@@ -1275,11 +1350,27 @@ class MarketMakerBot:
         self.logger.info(f"  Active orders: {active}")
         self.logger.info("=" * 60)
     
+    def _log_config(self) -> None:
+        """Логирование конфигурации при старте"""
+        self.logger.info("📋 CONFIGURATION:")
+        self.logger.info(f"  Strategy: DELTA-NEUTRAL (BUY both sides)")
+        self.logger.info(f"  Order size: ${self.config.order_size_usd:.2f}")
+        self.logger.info(f"  Target spread: {self.config.target_spread:.1%}")
+        self.logger.info(f"  Max position: ${self.config.max_position_usd:.2f}")
+        self.logger.info(f"  Probability filter: {self.config.min_probability:.0%} - {self.config.max_probability:.0%}")
+        self.logger.info(f"  Liquidity filter: ${self.config.min_liquidity_usd:.0f} - ${self.config.max_liquidity_usd:.0f}")
+        self.logger.info(f"  Rebalance interval: {self.config.rebalance_interval_sec}s")
+        self.logger.info(f"  Market fallback: {'ON' if self.config.enable_market_fallback else 'OFF'}")
+        if self.config.enable_market_fallback:
+            self.logger.info(f"  Max market loss: {self.config.max_market_loss_percent:.1f}%")
+        self.logger.info("=" * 60)
+    
     async def run(self) -> None:
         """Запустить бота"""
         self.logger.info("=" * 60)
         self.logger.info("🚀 PREDICT.FUN MARKET MAKER BOT")
         self.logger.info("=" * 60)
+        self._log_config()
         self._running = True
         
         async with self.graphql_client:
@@ -1380,6 +1471,12 @@ def load_config() -> BotConfig:
         config.max_probability = float(os.getenv("MAX_PROB_PERCENT")) / 100.0
     if os.getenv("ORDER_EXPIRY_MINUTES"):
         config.order_expiry_minutes = int(os.getenv("ORDER_EXPIRY_MINUTES"))
+    if os.getenv("MAX_POSITION_USD"):
+        config.max_position_usd = float(os.getenv("MAX_POSITION_USD"))
+    if os.getenv("ENABLE_MARKET_FALLBACK"):
+        config.enable_market_fallback = os.getenv("ENABLE_MARKET_FALLBACK", "").lower() in ("true", "1", "yes")
+    if os.getenv("MAX_MARKET_LOSS_PERCENT"):
+        config.max_market_loss_percent = float(os.getenv("MAX_MARKET_LOSS_PERCENT"))
     
     return config
 
