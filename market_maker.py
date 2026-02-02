@@ -1743,9 +1743,38 @@ class MarketMakerBot:
                     else:
                         await self.place_limit_orders(updated)
                 else:
-                    # Рынок больше не подходит - удаляем
-                    self.logger.info(f"  📤 Market no longer suitable, removing...")
-                    del self.markets[market_id]
+                    # Рынок больше не подходит, НО сначала проверяем позицию!
+                    existing_position = await self._check_existing_position(updated or state.market)
+                    
+                    if existing_position:
+                        position_info, other_outcome = existing_position
+                        self.logger.info(f"  ⚠️  Market unsuitable but has position: {position_info['name']} ${position_info['value_usd']:.2f}")
+                        self.logger.info(f"  🛡️ Keeping market for hedge management only")
+                        
+                        # Оставляем рынок в tracking только для hedge
+                        state.has_unhedged_position = True
+                        state.market = updated or state.market
+                        
+                        # Размещаем hedge ордер
+                        market_price = float(other_outcome.ask_price) if other_outcome.ask_price else 0.5
+                        size_usd = position_info['value_usd']
+                        size_wei = int(Decimal(str(size_usd / market_price)) * WEI_MULTIPLIER)
+                        
+                        order = await self._place_single_order(
+                            market=state.market,
+                            outcome=other_outcome,
+                            side=Side.BUY,
+                            price=Decimal(str(market_price)),
+                            size_wei=size_wei
+                        )
+                        if order:
+                            self.logger.info(f"  ✅ Hedge order placed: {other_outcome.name} @ ${market_price:.4f}")
+                        
+                        state.last_rebalance = datetime.now()
+                    else:
+                        # Нет позиции - можно безопасно удалить
+                        self.logger.info(f"  📤 Market no longer suitable (no position), removing...")
+                        del self.markets[market_id]
                 
                 await asyncio.sleep(self.config.api_delay_sec)
                 
@@ -2183,14 +2212,167 @@ class MarketMakerBot:
             import traceback
             self.logger.debug(traceback.format_exc())
     
+    async def _check_orphaned_positions(self) -> None:
+        """
+        Периодическая проверка "осиротевших" позиций
+        
+        Позиция считается осиротевшей если:
+        1. Она существует на бирже
+        2. Её рынок НЕ отслеживается в self.markets
+        3. Она не delta-neutral (только одна сторона)
+        
+        Вызывается каждый цикл главного loop.
+        """
+        try:
+            positions = await self.graphql_client.get_positions()
+            if not positions:
+                return
+            
+            # Группируем позиции по market_id
+            positions_by_market: dict[str, list[dict]] = {}
+            for pos in positions:
+                market_info = pos.get("market", {})
+                market_id = str(pos.get("marketId") or market_info.get("id") or "")
+                if market_id:
+                    if market_id not in positions_by_market:
+                        positions_by_market[market_id] = []
+                    positions_by_market[market_id].append(pos)
+            
+            # Проверяем каждый рынок с позицией
+            orphaned_count = 0
+            for market_id, market_positions in positions_by_market.items():
+                # Пропускаем если рынок уже отслеживается
+                if market_id in self.markets:
+                    continue
+                
+                # Проверяем количество сторон позиции
+                outcome_sides = set()
+                total_value = 0.0
+                
+                for pos in market_positions:
+                    outcome_info = pos.get("outcome") or {}
+                    token_id = str(outcome_info.get("onChainId") or pos.get("tokenId") or "")
+                    value_raw = pos.get("valueUsd") or 0
+                    try:
+                        value = float(str(value_raw).replace(",", "."))
+                    except:
+                        value = 0
+                    
+                    if token_id and value > 0.5:  # Минимум $0.5
+                        outcome_sides.add(token_id)
+                        total_value += value
+                
+                # Если только одна сторона и стоимость > $0.9 - нужен hedge
+                if len(outcome_sides) == 1 and total_value >= 0.9:
+                    orphaned_count += 1
+                    market_title = market_positions[0].get("market", {}).get("title", market_id)[:30]
+                    self.logger.warning(f"🚨 ORPHANED POSITION: {market_title}... | Value: ${total_value:.2f}")
+                    
+                    # Пытаемся захеджировать
+                    await self._hedge_orphaned_position(market_id, market_positions)
+            
+            if orphaned_count > 0:
+                self.logger.info(f"📋 Found {orphaned_count} orphaned position(s) requiring hedge")
+                
+        except Exception as e:
+            self.logger.debug(f"Orphaned position check error: {e}")
+    
+    async def _hedge_orphaned_position(self, market_id: str, positions: list[dict]) -> None:
+        """Захеджировать осиротевшую позицию"""
+        try:
+            # Получаем данные рынка
+            market = await self.graphql_client.get_market(market_id)
+            if not market:
+                self.logger.warning(f"  ⚠️  Could not fetch market {market_id}")
+                return
+            
+            # Парсим позицию
+            filled_token_id = None
+            filled_value = 0.0
+            filled_name = "Unknown"
+            
+            for pos in positions:
+                outcome_info = pos.get("outcome") or {}
+                token_id = str(outcome_info.get("onChainId") or pos.get("tokenId") or "")
+                name = outcome_info.get("name") or "Unknown"
+                value_raw = pos.get("valueUsd") or 0
+                try:
+                    value = float(str(value_raw).replace(",", "."))
+                except:
+                    value = 0
+                
+                if token_id and value > filled_value:
+                    filled_token_id = token_id
+                    filled_value = value
+                    filled_name = name
+            
+            if not filled_token_id or filled_value < 0.9:
+                return
+            
+            # Находим противоположный outcome
+            other_outcome = None
+            for outcome in market.outcomes:
+                if outcome.on_chain_id != filled_token_id:
+                    other_outcome = outcome
+                    break
+            
+            if not other_outcome or not other_outcome.on_chain_id:
+                self.logger.warning(f"  ⚠️  Could not find opposite outcome for {filled_name}")
+                return
+            
+            # Проверяем нет ли уже ордера на этот token
+            for order_info in self.active_orders.values():
+                if order_info.token_id == other_outcome.on_chain_id and order_info.status == OrderStatus.OPEN:
+                    self.logger.info(f"  ✅ Hedge order already exists for {other_outcome.name}")
+                    return
+            
+            # Размещаем hedge
+            market_price = float(other_outcome.ask_price) if other_outcome.ask_price else 0.5
+            size_wei = int(Decimal(str(filled_value / market_price)) * WEI_MULTIPLIER)
+            
+            self.logger.info(f"  🛡️ Hedging orphaned {filled_name} ${filled_value:.2f} → {other_outcome.name} @ ${market_price:.4f}")
+            
+            order = await self._place_single_order(
+                market=market,
+                outcome=other_outcome,
+                side=Side.BUY,
+                price=Decimal(str(market_price)),
+                size_wei=size_wei
+            )
+            
+            if order:
+                self.logger.info(f"  ✅ Orphaned position hedged!")
+                # Добавляем рынок в tracking
+                self.markets[market_id] = MarketState(
+                    market=market,
+                    entered_at=datetime.now(),
+                    last_rebalance=datetime.now(),
+                    has_unhedged_position=True
+                )
+                
+        except Exception as e:
+            self.logger.error(f"  ❌ Hedge orphaned error: {e}")
+    
     def log_statistics(self) -> None:
         """Логирование статистики"""
         self.logger.info("=" * 60)
         self.logger.info("📊 STATISTICS")
-        self.logger.info(f"  Markets: {len(self.markets)} | Orders placed: {self.orders_placed}")
-        self.logger.info(f"  Filled: {self.orders_filled} | Cancelled: {self.orders_cancelled}")
+        
+        # Считаем типы рынков
+        normal_markets = sum(1 for s in self.markets.values() if not s.has_unhedged_position)
+        hedge_only_markets = sum(1 for s in self.markets.values() if s.has_unhedged_position)
+        
+        self.logger.info(f"  Markets: {len(self.markets)} (normal: {normal_markets}, hedge-only: {hedge_only_markets})")
+        self.logger.info(f"  Orders placed: {self.orders_placed} | Filled: {self.orders_filled} | Cancelled: {self.orders_cancelled}")
+        
         active = sum(1 for o in self.active_orders.values() if o.status == OrderStatus.OPEN)
         self.logger.info(f"  Active orders: {active}")
+        
+        # Показываем hedge-only рынки если есть
+        if hedge_only_markets > 0:
+            hedge_markets = [s.market.title[:25] for s in self.markets.values() if s.has_unhedged_position]
+            self.logger.info(f"  🛡️ Hedge-only: {', '.join(hedge_markets)}")
+        
         self.logger.info("=" * 60)
     
     def _log_config(self) -> None:
@@ -2269,6 +2451,9 @@ class MarketMakerBot:
                         
                         # Ребалансировка существующих позиций
                         await self._rebalance_existing_markets()
+                        
+                        # ВАЖНО: Проверяем осиротевшие позиции (не отслеживаемые в self.markets)
+                        await self._check_orphaned_positions()
                         
                         self.log_statistics()
                         await asyncio.sleep(self.config.rebalance_interval_sec)
