@@ -1193,6 +1193,46 @@ class MarketMakerBot:
                 self.logger.info(f"  ⏭️  Skipping: market has unhedged position (hedge only)")
                 return []
             
+            # ВАЖНО: Перед размещением ордеров проверяем существующие позиции на бирже
+            # Это нужно для случаев когда рынок был удалён из tracking (ротация),
+            # но позиция на бирже осталась
+            existing_position = await self._check_existing_position(market)
+            if existing_position:
+                position_info, other_outcome = existing_position
+                self.logger.info(f"  ⚠️  Found existing position: {position_info['name']} ${position_info['value_usd']:.2f}")
+                self.logger.info(f"  🛡️ Placing hedge order instead of delta-neutral pair")
+                
+                # Размещаем только hedge ордер
+                market_price = float(other_outcome.ask_price) if other_outcome.ask_price else 0.5
+                size_usd = position_info['value_usd']
+                size_wei = int(Decimal(str(size_usd / market_price)) * WEI_MULTIPLIER)
+                
+                order = await self._place_single_order(
+                    market=market,
+                    outcome=other_outcome,
+                    side=Side.BUY,
+                    price=Decimal(str(market_price)),
+                    size_wei=size_wei
+                )
+                
+                if order:
+                    placed_orders.append(order)
+                    self.logger.info(f"  ✅ Hedge order placed: {other_outcome.name} @ ${market_price:.4f}")
+                
+                # Добавляем в tracking с флагом unhedged
+                if market.market_id not in self.markets:
+                    self.markets[market.market_id] = MarketState(
+                        market=market,
+                        entered_at=datetime.now(),
+                        last_rebalance=datetime.now(),
+                        has_unhedged_position=True
+                    )
+                else:
+                    self.markets[market.market_id].has_unhedged_position = True
+                    self.markets[market.market_id].last_rebalance = datetime.now()
+                
+                return placed_orders
+            
             # Проверяем лимит позиции
             current_position = state.position_usd if state else 0.0
             
@@ -1384,6 +1424,96 @@ class MarketMakerBot:
             return 0.0  # Нет убытка, есть профит
         return (total_cost - 1.0) * 100  # Убыток в %
     
+    async def _check_existing_position(self, market: MarketData) -> Optional[tuple[dict, OutcomeData]]:
+        """
+        Проверить есть ли существующая незахеджированная позиция на рынке
+        
+        Возвращает (position_info, opposite_outcome) если нужен hedge,
+        None если позиции нет или уже delta-neutral
+        """
+        try:
+            positions = await self.graphql_client.get_positions()
+            if not positions:
+                return None
+            
+            # Фильтруем позиции для этого рынка
+            market_positions = []
+            for pos in positions:
+                market_info = pos.get("market", {})
+                pos_market_id = str(pos.get("marketId") or market_info.get("id") or "")
+                if pos_market_id == market.market_id:
+                    market_positions.append(pos)
+            
+            if not market_positions:
+                return None
+            
+            # Парсим позиции
+            outcome_positions = {}
+            for pos in market_positions:
+                outcome_info = pos.get("outcome") or {}
+                token_id = str(
+                    outcome_info.get("onChainId") or
+                    outcome_info.get("tokenId") or
+                    pos.get("tokenId") or
+                    ""
+                )
+                outcome_name = outcome_info.get("name") or "Unknown"
+                
+                value_usd_raw = pos.get("valueUsd") or 0
+                try:
+                    value_usd = float(str(value_usd_raw).replace(",", "."))
+                except:
+                    value_usd = 0
+                
+                quantity_raw = pos.get("amount") or pos.get("shares") or 0
+                try:
+                    quantity = float(str(quantity_raw).replace(",", "."))
+                    if quantity > 1e15:
+                        quantity = quantity / WEI_MULTIPLIER
+                except:
+                    quantity = 0
+                
+                if token_id and (quantity > 0 or value_usd > 0):
+                    outcome_positions[token_id] = {
+                        "name": outcome_name,
+                        "value_usd": value_usd,
+                        "quantity": quantity,
+                        "token_id": token_id
+                    }
+            
+            # Если 2+ сторон - уже delta-neutral, не нужен hedge
+            if len(outcome_positions) >= 2:
+                return None
+            
+            # Если 0 позиций - нет существующей позиции
+            if len(outcome_positions) == 0:
+                return None
+            
+            # Одна сторона - нужен hedge
+            filled_token_id = list(outcome_positions.keys())[0]
+            filled_pos = outcome_positions[filled_token_id]
+            
+            # Минимальный размер ордера
+            MIN_ORDER_VALUE_USD = 0.9
+            if filled_pos['value_usd'] < MIN_ORDER_VALUE_USD:
+                return None  # Слишком маленькая позиция
+            
+            # Находим противоположный outcome
+            other_outcome = None
+            for outcome in market.outcomes:
+                if outcome.on_chain_id != filled_token_id:
+                    other_outcome = outcome
+                    break
+            
+            if not other_outcome or not other_outcome.on_chain_id:
+                return None
+            
+            return (filled_pos, other_outcome)
+            
+        except Exception as e:
+            self.logger.debug(f"  Position check error: {e}")
+            return None
+    
     async def _ensure_position_hedged(self, market_id: str, market: MarketData) -> bool:
         """
         Проверить есть ли незахеджированная позиция и разместить hedge ордер
@@ -1527,6 +1657,18 @@ class MarketMakerBot:
                     if hold_minutes >= self.config.max_market_hold_minutes:
                         self.logger.info(f"🔄 ROTATION: {state.market.title[:40]}...")
                         self.logger.info(f"  ⏰ Held for {hold_minutes:.0f} min >= {self.config.max_market_hold_minutes} min limit")
+                        
+                        # ВАЖНО: Перед удалением проверяем есть ли незахеджированная позиция
+                        # Если есть - оставляем в tracking и размещаем/обновляем hedge
+                        existing_position = await self._check_existing_position(state.market)
+                        if existing_position:
+                            position_info, other_outcome = existing_position
+                            self.logger.info(f"  ⚠️  Has unhedged position: {position_info['name']} ${position_info['value_usd']:.2f}")
+                            self.logger.info(f"  🛡️ Keeping market for hedge management (not rotating)")
+                            state.has_unhedged_position = True
+                            # Не удаляем рынок - нужно поддерживать hedge
+                            continue
+                        
                         await self.cancel_old_orders(market_id)
                         del self.markets[market_id]
                         continue
