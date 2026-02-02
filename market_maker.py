@@ -1678,6 +1678,13 @@ class MarketMakerBot:
                 except (ValueError, TypeError):
                     quantity = 0
                 
+                # Получаем USD value (нужно до avgPrice для вычисления)
+                value_usd_raw = pos.get("valueUsd") or pos.get("value") or pos.get("totalValue") or 0
+                try:
+                    value_usd = float(str(value_usd_raw).replace(",", "."))
+                except (ValueError, TypeError):
+                    value_usd = 0
+                
                 # Получаем цену входа - много возможных названий
                 avg_price_raw = (
                     pos.get("avgPrice") or 
@@ -1698,13 +1705,6 @@ class MarketMakerBot:
                 # Если avgPrice не найден, но есть valueUsd и quantity - вычисляем
                 if avg_price == 0 and quantity > 0 and value_usd > 0:
                     avg_price = value_usd / quantity
-                
-                # Получаем USD value
-                value_usd_raw = pos.get("valueUsd") or pos.get("value") or pos.get("totalValue") or 0
-                try:
-                    value_usd = float(str(value_usd_raw).replace(",", "."))
-                except (ValueError, TypeError):
-                    value_usd = 0
                 
                 # Если нет token_id, попробуем использовать outcome name как идентификатор
                 position_key = token_id or outcome_name
