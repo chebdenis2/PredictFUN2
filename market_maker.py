@@ -1378,18 +1378,22 @@ class MarketMakerBot:
             return 0.0  # Нет убытка, есть профит
         return (total_cost - 1.0) * 100  # Убыток в %
     
-    async def _ensure_position_hedged(self, market_id: str, market: MarketData) -> None:
+    async def _ensure_position_hedged(self, market_id: str, market: MarketData) -> bool:
         """
         Проверить есть ли незахеджированная позиция и разместить hedge ордер
         
         Вызывается при ребалансировке ПЕРЕД размещением новых ордеров,
         чтобы существующая позиция не осталась без защиты.
+        
+        Returns:
+            True если был размещён hedge ордер (не нужны дополнительные лимитки)
+            False если позиция уже delta-neutral или нет позиции
         """
         try:
             # Получаем текущие позиции
             positions = await self.graphql_client.get_positions()
             if not positions:
-                return
+                return False
             
             # Фильтруем позиции для этого рынка
             market_positions = []
@@ -1400,7 +1404,7 @@ class MarketMakerBot:
                     market_positions.append(pos)
             
             if not market_positions:
-                return
+                return False
             
             # Парсим позиции
             outcome_positions = {}
@@ -1431,9 +1435,9 @@ class MarketMakerBot:
                         "token_id": token_id
                     }
             
-            # Если 2+ сторон - уже delta-neutral
+            # Если 2+ сторон - уже delta-neutral, можно размещать обычные лимитки
             if len(outcome_positions) >= 2:
-                return
+                return False
             
             # Если 1 сторона - нужен hedge
             if len(outcome_positions) == 1:
@@ -1443,7 +1447,7 @@ class MarketMakerBot:
                 # Минимальный размер ордера
                 MIN_ORDER_VALUE_USD = 0.9
                 if filled_pos['value_usd'] < MIN_ORDER_VALUE_USD:
-                    return
+                    return False  # Слишком маленькая позиция, пусть размещает обычные лимитки
                 
                 # Находим противоположный outcome
                 other_outcome = None
@@ -1453,7 +1457,7 @@ class MarketMakerBot:
                         break
                 
                 if not other_outcome or not other_outcome.on_chain_id:
-                    return
+                    return False
                 
                 # Размещаем hedge ордер
                 market_price = float(other_outcome.ask_price) if other_outcome.ask_price else 0.5
@@ -1471,9 +1475,16 @@ class MarketMakerBot:
                 )
                 if order:
                     self.logger.info(f"  ✅ Hedge order placed: {other_outcome.name} @ ${market_price:.4f}")
+                    return True  # Hedge размещён, не нужны доп. лимитки
+                
+                return False  # Не удалось разместить hedge
+            
+            # len(outcome_positions) == 0 - нет валидных позиций
+            return False
                     
         except Exception as e:
             self.logger.debug(f"  Position hedge check error: {e}")
+            return False
     
     async def _check_and_handle_partial_fills(self, market_id: str, state: MarketState) -> None:
         """
@@ -1542,9 +1553,14 @@ class MarketMakerBot:
                     state.market = updated
                     
                     # ВАЖНО: Проверяем позиции и размещаем hedge если нужно
-                    await self._ensure_position_hedged(market_id, updated)
+                    # Если hedge был размещён - не размещаем дополнительные лимитки
+                    hedge_placed = await self._ensure_position_hedged(market_id, updated)
                     
-                    await self.place_limit_orders(updated)
+                    if hedge_placed:
+                        self.logger.info(f"  ⏭️ Skipping limit orders (hedge already placed)")
+                        state.last_rebalance = datetime.now()
+                    else:
+                        await self.place_limit_orders(updated)
                 else:
                     # Рынок больше не подходит - удаляем
                     self.logger.info(f"  📤 Market no longer suitable, removing...")
