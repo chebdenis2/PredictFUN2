@@ -1547,11 +1547,19 @@ class MarketMakerBot:
         
         1. Получить открытые позиции
         2. Найти незахеджированные (только одна сторона)
-        3. Попробовать закрыть delta-neutral:
+        3. Проверить нет ли уже открытого hedge ордера
+        4. Попробовать закрыть delta-neutral:
            - По рынку если убыток < порога
            - Лимиткой если убыток > порога
         """
         self.logger.info("🔍 Recovering existing positions...")
+        
+        # Собираем token_ids из существующих открытых ордеров
+        # чтобы не дублировать hedge ордера
+        self._existing_order_tokens: set[str] = set()
+        for order_id, order_info in self.active_orders.items():
+            if order_info.token_id:
+                self._existing_order_tokens.add(order_info.token_id)
         
         try:
             positions = await self.graphql_client.get_positions()
@@ -1774,6 +1782,12 @@ class MarketMakerBot:
             # Проверяем что у opposite outcome есть on_chain_id для размещения ордера
             if not other_outcome.on_chain_id:
                 self.logger.warning(f"    ❌ Opposite outcome {other_outcome.name} has no on_chain_id")
+                return
+            
+            # Проверяем нет ли уже открытого ордера на этот token (hedge уже размещён)
+            existing_tokens = getattr(self, '_existing_order_tokens', set())
+            if other_outcome.on_chain_id in existing_tokens:
+                self.logger.info(f"    ✅ Hedge order already exists for {other_outcome.name} - skipping")
                 return
             
             # Текущая рыночная цена другой стороны (ask price)
