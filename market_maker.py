@@ -681,6 +681,21 @@ class PredictGraphQLClient:
         """
         Получить открытые позиции через REST API
         GET /v1/positions
+        
+        Response format:
+        {
+            "success": true,
+            "data": [
+                {
+                    "id": "base64...",
+                    "valueUsd": "18.76",
+                    "market": {"id": "6126", "title": "$85,000..."},
+                    "outcome": {"id": "...", "name": "YES", "onChainId": "12345..."},
+                    "shares": "50.7",
+                    "avgPrice": "39.4" (in cents)
+                }
+            ]
+        }
         """
         try:
             response = await self._rest_request_auth("GET", "/v1/positions")
@@ -695,6 +710,25 @@ class PredictGraphQLClient:
         """
         Получить ордера через REST API
         GET /v1/orders?status=OPEN
+        
+        Response format:
+        {
+            "success": true,
+            "data": [
+                {
+                    "order": {
+                        "hash": "0x...",
+                        "tokenId": "12345...",
+                        "maker": "0x...",
+                        ...
+                    },
+                    "id": "4290750",
+                    "marketId": "6169",
+                    "pricePerShare": "540000000000000000",
+                    ...
+                }
+            ]
+        }
         """
         try:
             response = await self._rest_request_auth("GET", f"/v1/orders?status={status}")
@@ -1439,12 +1473,29 @@ class MarketMakerBot:
             
             self.logger.info(f"  📋 Found {len(orders)} open order(s)")
             
-            for order in orders:
-                order_id = str(order.get("id", order.get("orderId", "")))
-                market_id = str(order.get("marketId", order.get("market", {}).get("id", "")))
+            for order_wrapper in orders:
+                # API может вернуть {order: {...}, ...} или напрямую {...}
+                order = order_wrapper.get("order", order_wrapper)
+                
+                order_id = str(order_wrapper.get("id", order.get("id", order.get("orderId", ""))))
+                
+                # Market ID может быть в разных местах
+                market_id = str(
+                    order_wrapper.get("marketId") or
+                    order_wrapper.get("market", {}).get("id") or
+                    order.get("marketId") or
+                    ""
+                )
+                
                 token_id = str(order.get("tokenId", ""))
-                price = order.get("price", order.get("pricePerShare", 0))
-                side = order.get("side", "")
+                
+                # Price может быть в разных форматах
+                price_raw = order_wrapper.get("pricePerShare") or order.get("pricePerShare") or 0
+                try:
+                    # pricePerShare обычно в wei (10^18), конвертируем в десятичную
+                    price_val = int(price_raw) / WEI_MULTIPLIER if price_raw else 0
+                except (ValueError, TypeError):
+                    price_val = float(price_raw) if price_raw else 0
                 
                 if market_id:
                     markets_with_orders.add(market_id)
@@ -1453,19 +1504,20 @@ class MarketMakerBot:
                 if order_id:
                     self.active_orders[order_id] = OrderInfo(
                         order_id=order_id,
-                        order_hash=order.get("hash", order.get("orderHash", "")),
+                        order_hash=order.get("hash", order_wrapper.get("orderHash", "")),
                         market_id=market_id,
                         token_id=token_id,
                         side=Side.BUY,  # Предполагаем BUY для delta-neutral
-                        price=Decimal(str(price)) if price else Decimal("0"),
+                        price=Decimal(str(price_val)) if price_val else Decimal("0"),
                         size_wei=0,
                         status=OrderStatus.OPEN,
                         created_at=datetime.now(),
                         expires_at=datetime.now() + timedelta(minutes=self.config.order_expiry_minutes)
                     )
-                    self.logger.info(f"    📝 Order {order_id}: market={market_id[:10]}... price={price}")
+                    self.logger.info(f"    📝 Order {order_id}: market={market_id[:10] if market_id else 'N/A'}... token={token_id[:10] if token_id else 'N/A'}...")
             
             # Добавляем рынки с ордерами в self.markets для отслеживания
+            # ВАЖНО: устанавливаем last_rebalance чтобы НЕ делать немедленную ребалансировку!
             for market_id in markets_with_orders:
                 if market_id not in self.markets:
                     # Получаем данные рынка
@@ -1474,16 +1526,19 @@ class MarketMakerBot:
                         if market:
                             self.markets[market_id] = MarketState(
                                 market=market,
-                                entered_at=datetime.now()  # Считаем как новый вход
+                                entered_at=datetime.now(),
+                                last_rebalance=datetime.now()  # ВАЖНО: не ребалансировать сразу!
                             )
                     except Exception as e:
                         self.logger.debug(f"    Could not load market {market_id}: {e}")
             
-            self.logger.info(f"  ✅ Loaded {len(markets_with_orders)} market(s) with existing orders")
+            self.logger.info(f"  ✅ Loaded {len(markets_with_orders)} market(s) with existing orders (will NOT rebalance immediately)")
             return markets_with_orders
             
         except Exception as e:
             self.logger.warning(f"⚠️  Failed to load open orders: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
             return markets_with_orders
     
     async def _recover_positions(self) -> None:
@@ -1507,14 +1562,30 @@ class MarketMakerBot:
             
             self.logger.info(f"  📊 Found {len(positions)} position(s)")
             
-            # Группируем позиции по market_id (conditionId)
+            # Логируем первую позицию для отладки структуры данных
+            if positions:
+                self.logger.debug(f"  Sample position structure: {json.dumps(positions[0], indent=2, default=str)[:500]}")
+            
+            # Группируем позиции по market_id
+            # API возвращает позиции в формате:
+            # {"id": "base64...", "valueUsd": "18.76", "market": {"id": "6126", "title": "..."}, 
+            #  "outcome": {"id": "...", "name": "YES", "onChainId": "..."}, "shares": "50.7", ...}
             positions_by_market: dict[str, list[dict]] = {}
             for pos in positions:
-                market_id = pos.get("marketId") or pos.get("market", {}).get("id", "")
+                # Market ID может быть в разных местах
+                market_info = pos.get("market", {})
+                market_id = str(
+                    pos.get("marketId") or 
+                    market_info.get("id") or 
+                    ""
+                )
+                
                 if market_id:
                     if market_id not in positions_by_market:
                         positions_by_market[market_id] = []
                     positions_by_market[market_id].append(pos)
+            
+            self.logger.info(f"  📈 Positions across {len(positions_by_market)} market(s)")
             
             for market_id, market_positions in positions_by_market.items():
                 await self._analyze_and_hedge_position(market_id, market_positions)
@@ -1530,6 +1601,16 @@ class MarketMakerBot:
     async def _analyze_and_hedge_position(self, market_id: str, positions: list[dict]) -> None:
         """
         Анализировать позицию и захеджировать если нужно
+        
+        API формат позиции:
+        {
+            "id": "base64...",
+            "valueUsd": "18.76",
+            "market": {"id": "6126", "title": "..."},
+            "outcome": {"id": "...", "name": "YES", "onChainId": "12345..."},
+            "shares": "50.7" или "quantity": 50.7,
+            "avgPrice": "0.394" или в центах "39.4"
+        }
         """
         try:
             # Получаем данные рынка
@@ -1538,35 +1619,85 @@ class MarketMakerBot:
                 self.logger.warning(f"  ⚠️  Market {market_id} not found")
                 return
             
-            self.logger.info(f"  📈 Analyzing: {market.title[:40]}...")
+            market_title = market.title[:40] if market.title else market_id[:20]
+            self.logger.info(f"  📈 Analyzing: {market_title}...")
             
-            # Определяем какие стороны у нас есть
-            # position обычно содержит: tokenId, quantity, side, entryPrice и т.д.
+            # Парсим позиции - определяем какие outcomes у нас есть
+            # API может возвращать данные в разных форматах
             outcome_positions = {}
+            
             for pos in positions:
-                token_id = pos.get("tokenId", "")
-                quantity = float(pos.get("quantity", 0) or pos.get("size", 0) or 0)
+                # Получаем outcome info
+                outcome_info = pos.get("outcome", {})
+                token_id = str(
+                    outcome_info.get("onChainId") or
+                    pos.get("tokenId") or
+                    pos.get("onChainId") or
+                    ""
+                )
+                outcome_name = outcome_info.get("name", "Unknown")
+                
+                # Получаем количество (shares)
+                quantity_raw = (
+                    pos.get("shares") or 
+                    pos.get("quantity") or 
+                    pos.get("size") or 
+                    0
+                )
+                try:
+                    quantity = float(quantity_raw)
+                except (ValueError, TypeError):
+                    quantity = 0
+                
+                # Получаем цену входа
+                avg_price_raw = (
+                    pos.get("avgPrice") or 
+                    pos.get("entryPrice") or 
+                    pos.get("averagePrice") or
+                    0
+                )
+                try:
+                    avg_price = float(avg_price_raw)
+                    # Если цена > 1, вероятно это в центах (39.4 = $0.394)
+                    if avg_price > 1:
+                        avg_price = avg_price / 100.0
+                except (ValueError, TypeError):
+                    avg_price = 0
+                
+                # Получаем USD value
+                value_usd_raw = pos.get("valueUsd") or pos.get("value") or 0
+                try:
+                    value_usd = float(value_usd_raw)
+                except (ValueError, TypeError):
+                    value_usd = 0
+                
                 if token_id and quantity > 0:
                     outcome_positions[token_id] = {
                         "quantity": quantity,
-                        "entry_price": float(pos.get("entryPrice", 0) or pos.get("avgPrice", 0) or 0),
-                        "token_id": token_id
+                        "entry_price": avg_price,
+                        "value_usd": value_usd,
+                        "token_id": token_id,
+                        "name": outcome_name
                     }
+                    self.logger.info(f"    Position: {outcome_name} | Qty: {quantity:.2f} | Avg: ${avg_price:.4f} | Value: ${value_usd:.2f}")
             
             if len(outcome_positions) == 0:
-                self.logger.info(f"    No active positions")
+                self.logger.info(f"    No active positions (could not parse data)")
                 return
             
             if len(outcome_positions) >= 2:
-                self.logger.info(f"    ✅ Already delta-neutral (both sides)")
+                self.logger.info(f"    ✅ Already delta-neutral (has {len(outcome_positions)} sides)")
+                # Обновляем state если рынок есть
+                if market_id in self.markets:
+                    self.markets[market_id].filled_outcome_0 = True
+                    self.markets[market_id].filled_outcome_1 = True
                 return
             
             # Только одна сторона - нужно захеджировать
             filled_token_id = list(outcome_positions.keys())[0]
             filled_pos = outcome_positions[filled_token_id]
             
-            self.logger.info(f"    ⚠️  UNHEDGED position: token={filled_token_id[:20]}...")
-            self.logger.info(f"    Entry price: {filled_pos['entry_price']:.4f}, Qty: {filled_pos['quantity']:.4f}")
+            self.logger.info(f"    ⚠️  UNHEDGED: {filled_pos['name']} | Entry: ${filled_pos['entry_price']:.4f} | Qty: {filled_pos['quantity']:.2f}")
             
             # Находим противоположный outcome
             other_outcome = None
@@ -1586,35 +1717,35 @@ class MarketMakerBot:
             filled_price = Decimal(str(filled_pos['entry_price']))
             loss_percent = self._calculate_market_entry_loss(filled_price, Decimal(str(market_price)))
             
-            self.logger.info(f"    Opposite side: {other_outcome.name} @ {market_price:.4f} (ask)")
-            self.logger.info(f"    Calculated loss if market entry: {loss_percent:.2f}%")
+            self.logger.info(f"    Hedge target: {other_outcome.name} @ ${market_price:.4f} (ask)")
+            self.logger.info(f"    Entry + Market = ${float(filled_price) + market_price:.4f} | Loss: {loss_percent:.2f}%")
             
             if loss_percent <= self.config.max_market_loss_percent:
-                # Входим по рынку
-                self.logger.info(f"    ✅ Loss acceptable, entering at MARKET price")
-                # Размер = количество первой позиции * цена (чтобы суммы совпали)
-                size_usd = filled_pos['quantity'] * filled_pos['entry_price']
+                # Входим по рынку - убыток приемлемый
+                self.logger.info(f"    ✅ Loss {loss_percent:.2f}% <= {self.config.max_market_loss_percent}%, entering at MARKET")
+                
+                # Размер = стоимость первой позиции, чтобы суммы были равны
+                size_usd = filled_pos['value_usd'] if filled_pos['value_usd'] > 0 else (filled_pos['quantity'] * filled_pos['entry_price'])
                 size_wei = int(Decimal(str(size_usd / market_price)) * WEI_MULTIPLIER)
                 
                 order = await self._place_single_order(
                     market=market,
                     outcome=other_outcome,
                     side=Side.BUY,
-                    price=Decimal(str(market_price)),  # По текущей цене
+                    price=Decimal(str(market_price)),
                     size_wei=size_wei
                 )
                 if order:
-                    self.logger.info(f"    ✅ Hedge order placed!")
+                    self.logger.info(f"    ✅ Hedge MARKET order placed for ${size_usd:.2f}!")
             else:
-                # Ставим лимитку
-                # Рассчитываем цену лимитки чтобы общий убыток был <= порога
-                # filled_price + limit_price <= 1 + max_loss%
+                # Ставим лимитку - убыток слишком большой
+                # Рассчитываем цену лимитки: filled_price + limit_price <= 1 + max_loss%
                 max_limit_price = 1.0 + (self.config.max_market_loss_percent / 100) - float(filled_price)
                 limit_price = Decimal(str(max(0.01, min(0.99, max_limit_price))))
                 
-                self.logger.info(f"    📝 Loss too high, placing LIMIT @ {limit_price:.4f}")
+                self.logger.info(f"    📝 Loss {loss_percent:.2f}% > {self.config.max_market_loss_percent}%, placing LIMIT @ ${float(limit_price):.4f}")
                 
-                size_usd = filled_pos['quantity'] * filled_pos['entry_price']
+                size_usd = filled_pos['value_usd'] if filled_pos['value_usd'] > 0 else (filled_pos['quantity'] * filled_pos['entry_price'])
                 size_wei = int(Decimal(str(size_usd / float(limit_price))) * WEI_MULTIPLIER)
                 
                 order = await self._place_single_order(
@@ -1625,10 +1756,12 @@ class MarketMakerBot:
                     size_wei=size_wei
                 )
                 if order:
-                    self.logger.info(f"    ✅ Hedge limit order placed!")
+                    self.logger.info(f"    ✅ Hedge LIMIT order placed for ${size_usd:.2f}!")
             
         except Exception as e:
             self.logger.error(f"    ❌ Hedge error: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
     
     def log_statistics(self) -> None:
         """Логирование статистики"""
