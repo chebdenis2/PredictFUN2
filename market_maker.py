@@ -226,14 +226,16 @@ class BotConfig:
     recover_positions_on_start: bool = True  # Восстанавливать позиции при старте
     
     # Order settings / Настройки ордеров
-    target_spread: float = 0.03          # Целевой спред от mid-price (±3%)
+    target_spread: float = 0.015         # Целевой спред от mid-price (±1.5% - ближе к рынку!)
     order_size_usd: float = 25.0         # Размер каждого ордера в USD
     min_order_size_usd: float = 5.0      # Минимальный размер ордера
     max_orders_per_market: int = 2       # Макс. ордеров на сторону (YES/NO)
+    aggressive_pricing: bool = False     # True = ставить ордера ближе к рынку (0.5% spread)
     
     # Timing / Тайминги
-    rebalance_interval_sec: int = 300    # Интервал ребалансировки (5 минут)
-    price_change_threshold: float = 0.02 # Порог изменения цены для ребалансировки
+    rebalance_interval_sec: int = 1200   # Интервал ребалансировки (20 минут - больше времени для fill!)
+    price_change_threshold: float = 0.02 # Порог изменения цены для ребалансировки (2%)
+    skip_rebalance_if_price_stable: bool = True  # Не ребалансировать если цена не изменилась
     order_expiry_minutes: int = 60       # Время жизни ордера (минуты)
     graphql_timeout_sec: int = 10        # Таймаут GraphQL запросов
     
@@ -327,6 +329,8 @@ class MarketState:
     filled_outcome_0: bool = False  # Сработал ли ордер на первый исход
     filled_outcome_1: bool = False  # Сработал ли ордер на второй исход
     has_unhedged_position: bool = False  # Есть незахеджированная позиция (только hedge ордера)
+    # Price tracking for smart rebalancing
+    last_mid_price: Optional[Decimal] = None  # Последняя mid-price при размещении ордеров
 
 
 # ================================================================================
@@ -1269,7 +1273,13 @@ class MarketMakerBot:
             mid_price = Decimal(str(market.chance_percentage / 100.0))
             
             # Пересчитываем размеры с учётом лимита
-            spread = Decimal(str(self.config.target_spread))
+            # Выбираем spread в зависимости от режима
+            if self.config.aggressive_pricing:
+                spread = Decimal("0.005")  # 0.5% - очень близко к рынку для быстрых fills
+                self.logger.info(f"  ⚡ AGGRESSIVE mode: 0.5% spread")
+            else:
+                spread = Decimal(str(self.config.target_spread))
+            
             bid_price = max(Decimal("0.01"), min(Decimal("0.99"), mid_price - spread))
             ask_price = max(Decimal("0.01"), min(Decimal("0.99"), mid_price + spread))
             
@@ -1281,7 +1291,7 @@ class MarketMakerBot:
             
             self.logger.info(f"  📊 DELTA-NEUTRAL STRATEGY:")
             self.logger.info(f"     Mid price: {mid_price:.4f} (from probability {market.chance_percentage:.0f}%)")
-            self.logger.info(f"     Spread: {self.config.target_spread:.2%}")
+            self.logger.info(f"     Spread: {float(spread):.2%}")
             self.logger.info(f"     {outcome_0.name}: BUY @ {bid_price:.4f} (mid - spread)")
             self.logger.info(f"     {outcome_1.name}: BUY @ {outcome_1_price:.4f} (1 - ask = 1 - {ask_price:.4f})")
             self.logger.info(f"     Order size: ${self.config.order_size_usd:.2f} each side")
@@ -1317,6 +1327,7 @@ class MarketMakerBot:
             
             self.markets[market.market_id].our_orders = placed_orders
             self.markets[market.market_id].last_rebalance = datetime.now()
+            self.markets[market.market_id].last_mid_price = mid_price  # Сохраняем цену для smart rebalance
             
             return placed_orders
             
@@ -1690,7 +1701,27 @@ class MarketMakerBot:
                     if elapsed < self.config.rebalance_interval_sec:
                         continue
                 
-                self.logger.info(f"🔄 Rebalancing: {state.market.title[:40]}...")
+                # Получаем актуальные данные рынка для проверки цены
+                updated = await self.graphql_client.get_market(market_id)
+                if not updated:
+                    self.logger.warning(f"  ⚠️  Could not fetch market {market_id} - skipping")
+                    continue
+                
+                # Smart rebalance: пропускаем если цена не изменилась значительно
+                if self.config.skip_rebalance_if_price_stable and state.last_mid_price is not None:
+                    current_mid = Decimal(str(updated.chance_percentage / 100.0))
+                    price_change = abs(float(current_mid - state.last_mid_price))
+                    
+                    if price_change < self.config.price_change_threshold:
+                        self.logger.info(f"⏭️  Skip rebalance: {state.market.title[:30]}... (price Δ {price_change:.2%} < {self.config.price_change_threshold:.2%})")
+                        # Обновляем время и данные рынка
+                        state.last_rebalance = datetime.now()
+                        state.market = updated
+                        continue
+                    else:
+                        self.logger.info(f"🔄 Rebalancing: {state.market.title[:40]}... (price moved {price_change:.2%})")
+                else:
+                    self.logger.info(f"🔄 Rebalancing: {state.market.title[:40]}...")
                 
                 # Проверяем частичное исполнение (market fallback)
                 await self._check_and_handle_partial_fills(market_id, state)
@@ -1698,8 +1729,7 @@ class MarketMakerBot:
                 # Отменяем старые
                 await self.cancel_old_orders(market_id)
                 
-                # Получаем актуальные данные
-                updated = await self.graphql_client.get_market(market_id)
+                # Проверяем что рынок ещё подходит (updated уже получен выше)
                 if updated and self._is_market_suitable(updated):
                     state.market = updated
                     
@@ -2169,10 +2199,12 @@ class MarketMakerBot:
         self.logger.info(f"  Strategy: DELTA-NEUTRAL (BUY both sides)")
         self.logger.info(f"  Order size: ${self.config.order_size_usd:.2f}")
         self.logger.info(f"  Target spread: {self.config.target_spread:.1%}")
+        self.logger.info(f"  Aggressive pricing: {'ON (0.5% spread)' if self.config.aggressive_pricing else 'OFF'}")
         self.logger.info(f"  Max position: ${self.config.max_position_usd:.2f}")
         self.logger.info(f"  Probability filter: {self.config.min_probability:.0%} - {self.config.max_probability:.0%}")
         self.logger.info(f"  Liquidity filter: ${self.config.min_liquidity_usd:.0f} - ${self.config.max_liquidity_usd:.0f}")
-        self.logger.info(f"  Rebalance interval: {self.config.rebalance_interval_sec}s")
+        self.logger.info(f"  Rebalance interval: {self.config.rebalance_interval_sec}s ({self.config.rebalance_interval_sec//60} min)")
+        self.logger.info(f"  Smart rebalance: {'ON' if self.config.skip_rebalance_if_price_stable else 'OFF'} (threshold: {self.config.price_change_threshold:.1%})")
         self.logger.info(f"  Market rotation: {self.config.max_market_hold_minutes} min (0=off)")
         self.logger.info(f"  Min time to expiry: {self.config.min_time_to_expiry_minutes} min")
         self.logger.info(f"  Market fallback: {'ON' if self.config.enable_market_fallback else 'OFF'}")
@@ -2315,6 +2347,12 @@ def load_config() -> BotConfig:
         config.min_time_to_expiry_minutes = int(os.getenv("MIN_TIME_TO_EXPIRY_MINUTES"))
     if os.getenv("RECOVER_POSITIONS"):
         config.recover_positions_on_start = os.getenv("RECOVER_POSITIONS", "").lower() in ("true", "1", "yes")
+    if os.getenv("AGGRESSIVE_PRICING"):
+        config.aggressive_pricing = os.getenv("AGGRESSIVE_PRICING", "").lower() in ("true", "1", "yes")
+    if os.getenv("SKIP_REBALANCE_IF_PRICE_STABLE"):
+        config.skip_rebalance_if_price_stable = os.getenv("SKIP_REBALANCE_IF_PRICE_STABLE", "").lower() in ("true", "1", "yes")
+    if os.getenv("PRICE_CHANGE_THRESHOLD"):
+        config.price_change_threshold = float(os.getenv("PRICE_CHANGE_THRESHOLD"))
     
     return config
 
