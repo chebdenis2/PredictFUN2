@@ -1420,6 +1420,72 @@ class MarketMakerBot:
             except Exception as e:
                 self.logger.error(f"❌ Rebalance error for {market_id}: {e}")
     
+    async def _recover_open_orders(self) -> set[str]:
+        """
+        Загрузить существующие открытые ордера при перезапуске
+        
+        Returns:
+            Set of market_ids that already have open orders
+        """
+        self.logger.info("🔍 Loading existing open orders...")
+        markets_with_orders: set[str] = set()
+        
+        try:
+            orders = await self.graphql_client.get_open_orders("OPEN")
+            
+            if not orders:
+                self.logger.info("  ✅ No existing open orders")
+                return markets_with_orders
+            
+            self.logger.info(f"  📋 Found {len(orders)} open order(s)")
+            
+            for order in orders:
+                order_id = str(order.get("id", order.get("orderId", "")))
+                market_id = str(order.get("marketId", order.get("market", {}).get("id", "")))
+                token_id = str(order.get("tokenId", ""))
+                price = order.get("price", order.get("pricePerShare", 0))
+                side = order.get("side", "")
+                
+                if market_id:
+                    markets_with_orders.add(market_id)
+                
+                # Добавляем в active_orders для отслеживания
+                if order_id:
+                    self.active_orders[order_id] = OrderInfo(
+                        order_id=order_id,
+                        order_hash=order.get("hash", order.get("orderHash", "")),
+                        market_id=market_id,
+                        token_id=token_id,
+                        side=Side.BUY,  # Предполагаем BUY для delta-neutral
+                        price=Decimal(str(price)) if price else Decimal("0"),
+                        size_wei=0,
+                        status=OrderStatus.OPEN,
+                        created_at=datetime.now(),
+                        expires_at=datetime.now() + timedelta(minutes=self.config.order_expiry_minutes)
+                    )
+                    self.logger.info(f"    📝 Order {order_id}: market={market_id[:10]}... price={price}")
+            
+            # Добавляем рынки с ордерами в self.markets для отслеживания
+            for market_id in markets_with_orders:
+                if market_id not in self.markets:
+                    # Получаем данные рынка
+                    try:
+                        market = await self.graphql_client.get_market(market_id)
+                        if market:
+                            self.markets[market_id] = MarketState(
+                                market=market,
+                                entered_at=datetime.now()  # Считаем как новый вход
+                            )
+                    except Exception as e:
+                        self.logger.debug(f"    Could not load market {market_id}: {e}")
+            
+            self.logger.info(f"  ✅ Loaded {len(markets_with_orders)} market(s) with existing orders")
+            return markets_with_orders
+            
+        except Exception as e:
+            self.logger.warning(f"⚠️  Failed to load open orders: {e}")
+            return markets_with_orders
+    
     async def _recover_positions(self) -> None:
         """
         Восстановить позиции при перезапуске бота
@@ -1613,8 +1679,12 @@ class MarketMakerBot:
                     self.logger.error("❌ Failed to login. Cannot place orders.")
                     return
                 
-                # Восстанавливаем позиции после перезапуска
+                # Восстанавливаем состояние после перезапуска
+                markets_with_orders: set[str] = set()
                 if self.config.recover_positions_on_start:
+                    # Сначала загружаем существующие ордера
+                    markets_with_orders = await self._recover_open_orders()
+                    # Затем проверяем незахеджированные позиции
                     await self._recover_positions()
                 else:
                     self.logger.info("⏭️  Position recovery disabled")
@@ -1632,9 +1702,15 @@ class MarketMakerBot:
                         
                         # Размещаем ордера на новых рынках
                         for market in markets[:5]:
-                            if market.market_id not in self.markets:
-                                await self.place_limit_orders(market)
-                                await asyncio.sleep(self.config.api_delay_sec)
+                            # Пропускаем если уже есть ордера (из recovery или текущей сессии)
+                            if market.market_id in self.markets:
+                                continue
+                            if market.market_id in markets_with_orders:
+                                self.logger.debug(f"  ⏭️  Skipping {market.title[:30]}... (has existing orders)")
+                                continue
+                            
+                            await self.place_limit_orders(market)
+                            await asyncio.sleep(self.config.api_delay_sec)
                         
                         # Ребалансировка существующих позиций
                         await self._rebalance_existing_markets()
