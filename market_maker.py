@@ -1564,7 +1564,14 @@ class MarketMakerBot:
             
             # Логируем первую позицию для отладки структуры данных
             if positions:
-                self.logger.debug(f"  Sample position structure: {json.dumps(positions[0], indent=2, default=str)[:500]}")
+                self.logger.info(f"  🔍 Sample position keys: {list(positions[0].keys())}")
+                # Логируем полную структуру первой позиции (для отладки)
+                pos_sample = positions[0]
+                self.logger.info(f"  🔍 Position sample: valueUsd={pos_sample.get('valueUsd')}, market={pos_sample.get('market', {}).get('title', 'N/A')[:30]}")
+                if pos_sample.get("outcome"):
+                    self.logger.info(f"  🔍 Outcome keys: {list(pos_sample.get('outcome', {}).keys())}")
+                else:
+                    self.logger.info(f"  🔍 No 'outcome' key found. Available keys: {list(pos_sample.keys())}")
             
             # Группируем позиции по market_id
             # API возвращает позиции в формате:
@@ -1627,37 +1634,57 @@ class MarketMakerBot:
             outcome_positions = {}
             
             for pos in positions:
-                # Получаем outcome info
-                outcome_info = pos.get("outcome", {})
+                # Логируем структуру для отладки (только первую позицию в маркете)
+                if not outcome_positions:
+                    self.logger.debug(f"    Raw position data: {json.dumps(pos, default=str)[:300]}")
+                
+                # Получаем outcome info - может быть в разных местах
+                outcome_info = pos.get("outcome") or pos.get("outcomeData") or {}
+                
+                # Token ID / onChainId может быть в разных местах
                 token_id = str(
                     outcome_info.get("onChainId") or
+                    outcome_info.get("tokenId") or
+                    outcome_info.get("id") or
                     pos.get("tokenId") or
                     pos.get("onChainId") or
+                    pos.get("outcomeId") or
                     ""
                 )
-                outcome_name = outcome_info.get("name", "Unknown")
                 
-                # Получаем количество (shares)
+                # Outcome name
+                outcome_name = (
+                    outcome_info.get("name") or
+                    outcome_info.get("title") or
+                    pos.get("outcomeName") or
+                    "Unknown"
+                )
+                
+                # Получаем количество (shares) - много возможных названий
                 quantity_raw = (
                     pos.get("shares") or 
                     pos.get("quantity") or 
-                    pos.get("size") or 
+                    pos.get("size") or
+                    pos.get("amount") or
+                    pos.get("balance") or
                     0
                 )
                 try:
-                    quantity = float(quantity_raw)
+                    quantity = float(str(quantity_raw).replace(",", "."))
                 except (ValueError, TypeError):
                     quantity = 0
                 
-                # Получаем цену входа
+                # Получаем цену входа - много возможных названий
                 avg_price_raw = (
                     pos.get("avgPrice") or 
-                    pos.get("entryPrice") or 
                     pos.get("averagePrice") or
+                    pos.get("entryPrice") or 
+                    pos.get("price") or
+                    pos.get("costBasis") or
                     0
                 )
                 try:
-                    avg_price = float(avg_price_raw)
+                    avg_price = float(str(avg_price_raw).replace(",", "."))
                     # Если цена > 1, вероятно это в центах (39.4 = $0.394)
                     if avg_price > 1:
                         avg_price = avg_price / 100.0
@@ -1665,14 +1692,18 @@ class MarketMakerBot:
                     avg_price = 0
                 
                 # Получаем USD value
-                value_usd_raw = pos.get("valueUsd") or pos.get("value") or 0
+                value_usd_raw = pos.get("valueUsd") or pos.get("value") or pos.get("totalValue") or 0
                 try:
-                    value_usd = float(value_usd_raw)
+                    value_usd = float(str(value_usd_raw).replace(",", "."))
                 except (ValueError, TypeError):
                     value_usd = 0
                 
-                if token_id and quantity > 0:
-                    outcome_positions[token_id] = {
+                # Если нет token_id, попробуем использовать outcome name как идентификатор
+                position_key = token_id or outcome_name
+                
+                # Если есть хоть какие-то данные - добавляем
+                if position_key and position_key != "Unknown" and (quantity > 0 or value_usd > 0):
+                    outcome_positions[position_key] = {
                         "quantity": quantity,
                         "entry_price": avg_price,
                         "value_usd": value_usd,
@@ -1680,9 +1711,15 @@ class MarketMakerBot:
                         "name": outcome_name
                     }
                     self.logger.info(f"    Position: {outcome_name} | Qty: {quantity:.2f} | Avg: ${avg_price:.4f} | Value: ${value_usd:.2f}")
+                else:
+                    # Логируем что не удалось распарсить
+                    self.logger.debug(f"    Could not parse position: key={position_key}, qty={quantity}, value={value_usd}")
             
             if len(outcome_positions) == 0:
                 self.logger.info(f"    No active positions (could not parse data)")
+                # Логируем доступные поля для отладки
+                if positions:
+                    self.logger.info(f"    Debug - first position keys: {list(positions[0].keys())}")
                 return
             
             if len(outcome_positions) >= 2:
@@ -1694,20 +1731,41 @@ class MarketMakerBot:
                 return
             
             # Только одна сторона - нужно захеджировать
-            filled_token_id = list(outcome_positions.keys())[0]
-            filled_pos = outcome_positions[filled_token_id]
+            filled_key = list(outcome_positions.keys())[0]
+            filled_pos = outcome_positions[filled_key]
+            filled_token_id = filled_pos.get("token_id", "")
+            filled_name = filled_pos.get("name", "Unknown")
             
-            self.logger.info(f"    ⚠️  UNHEDGED: {filled_pos['name']} | Entry: ${filled_pos['entry_price']:.4f} | Qty: {filled_pos['quantity']:.2f}")
+            self.logger.info(f"    ⚠️  UNHEDGED: {filled_name} | Entry: ${filled_pos['entry_price']:.4f} | Qty: {filled_pos['quantity']:.2f}")
             
             # Находим противоположный outcome
+            # Сначала пробуем по token_id, потом по имени
             other_outcome = None
             for outcome in market.outcomes:
-                if outcome.on_chain_id != filled_token_id:
+                # По token_id
+                if filled_token_id and outcome.on_chain_id != filled_token_id:
+                    other_outcome = outcome
+                    break
+                # По имени (если нет token_id)
+                if not filled_token_id and outcome.name.lower() != filled_name.lower():
                     other_outcome = outcome
                     break
             
             if not other_outcome:
-                self.logger.warning(f"    ❌ Could not find opposite outcome")
+                # Если рынок бинарный, просто берём другой outcome
+                if len(market.outcomes) == 2:
+                    for outcome in market.outcomes:
+                        if outcome.name.lower() != filled_name.lower():
+                            other_outcome = outcome
+                            break
+            
+            if not other_outcome:
+                self.logger.warning(f"    ❌ Could not find opposite outcome for {filled_name}")
+                return
+            
+            # Проверяем что у opposite outcome есть on_chain_id для размещения ордера
+            if not other_outcome.on_chain_id:
+                self.logger.warning(f"    ❌ Opposite outcome {other_outcome.name} has no on_chain_id")
                 return
             
             # Текущая рыночная цена другой стороны (ask price)
