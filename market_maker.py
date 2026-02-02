@@ -121,6 +121,7 @@ query GetCategoryMarkets($categoryId: ID!, $first: Int!) {
     title
     isNegRisk
     isYieldBearing
+    endsAt
     markets(pagination: {first: $first}) {
       edges {
         node {
@@ -217,6 +218,10 @@ class BotConfig:
     enable_market_fallback: bool = True  # Разрешить рыночные ордера для delta-neutral
     max_market_loss_percent: float = 2.0 # Макс. убыток % для рыночного входа (если больше — оставить лимитку)
     
+    # Market rotation / Ротация рынков
+    max_market_hold_minutes: int = 60    # Максимум минут на одном рынке (0 = без лимита)
+    min_time_to_expiry_minutes: int = 30 # Не входить если до экспирации < X минут
+    
     # Order settings / Настройки ордеров
     target_spread: float = 0.03          # Целевой спред от mid-price (±3%)
     order_size_usd: float = 25.0         # Размер каждого ордера в USD
@@ -289,6 +294,7 @@ class MarketData:
     is_neg_risk: bool = False
     is_yield_bearing: bool = False
     category_id: Optional[str] = None
+    ends_at: Optional[datetime] = None  # Время экспирации рынка
 
 
 @dataclass
@@ -312,6 +318,7 @@ class MarketState:
     market: MarketData
     our_orders: list[OrderInfo] = field(default_factory=list)
     last_rebalance: Optional[datetime] = None
+    entered_at: Optional[datetime] = None  # Когда вошли в рынок (для ротации)
     # Position tracking
     position_usd: float = 0.0  # Текущий размер позиции в USD
     filled_outcome_0: bool = False  # Сработал ли ордер на первый исход
@@ -461,6 +468,16 @@ class PredictGraphQLClient:
         is_neg_risk = category.get("isNegRisk", False)
         is_yield_bearing = category.get("isYieldBearing", False)
         
+        # Parse ends_at
+        ends_at = None
+        ends_at_str = category.get("endsAt")
+        if ends_at_str:
+            try:
+                # ISO format: 2026-01-30T15:00:00.000Z
+                ends_at = datetime.fromisoformat(ends_at_str.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                pass
+        
         markets = []
         edges = category.get("markets", {}).get("edges", [])
         
@@ -497,6 +514,7 @@ class PredictGraphQLClient:
                 is_neg_risk=is_neg_risk,
                 is_yield_bearing=is_yield_bearing,
                 category_id=category_id,
+                ends_at=ends_at,
             ))
         
         return markets
@@ -891,6 +909,13 @@ class MarketMakerBot:
         if market.status not in ["CREATED", "REGISTERED", "UNPAUSED"]:
             return False
         
+        # Проверяем время до экспирации
+        if market.ends_at and self.config.min_time_to_expiry_minutes > 0:
+            now = datetime.now(market.ends_at.tzinfo) if market.ends_at.tzinfo else datetime.now()
+            time_to_expiry = (market.ends_at - now).total_seconds() / 60
+            if time_to_expiry < self.config.min_time_to_expiry_minutes:
+                return False
+        
         # Проверяем вероятность
         prob = market.chance_percentage / 100.0
         if not (self.config.min_probability <= prob <= self.config.max_probability):
@@ -1174,7 +1199,10 @@ class MarketMakerBot:
             
             # Обновляем состояние
             if market.market_id not in self.markets:
-                self.markets[market.market_id] = MarketState(market=market)
+                self.markets[market.market_id] = MarketState(
+                    market=market,
+                    entered_at=datetime.now()  # Время входа для ротации
+                )
             
             self.markets[market.market_id].our_orders = placed_orders
             self.markets[market.market_id].last_rebalance = datetime.now()
@@ -1311,6 +1339,27 @@ class MarketMakerBot:
         """Ребалансировка существующих рынков"""
         for market_id, state in list(self.markets.items()):
             try:
+                # Проверяем ротацию (слишком долго на рынке)
+                if self.config.max_market_hold_minutes > 0 and state.entered_at:
+                    hold_minutes = (datetime.now() - state.entered_at).total_seconds() / 60
+                    if hold_minutes >= self.config.max_market_hold_minutes:
+                        self.logger.info(f"🔄 ROTATION: {state.market.title[:40]}...")
+                        self.logger.info(f"  ⏰ Held for {hold_minutes:.0f} min >= {self.config.max_market_hold_minutes} min limit")
+                        await self.cancel_old_orders(market_id)
+                        del self.markets[market_id]
+                        continue
+                
+                # Проверяем время до экспирации
+                if state.market.ends_at and self.config.min_time_to_expiry_minutes > 0:
+                    now = datetime.now(state.market.ends_at.tzinfo) if state.market.ends_at.tzinfo else datetime.now()
+                    time_to_expiry = (state.market.ends_at - now).total_seconds() / 60
+                    if time_to_expiry < self.config.min_time_to_expiry_minutes:
+                        self.logger.info(f"⏰ EXPIRY CLOSE: {state.market.title[:40]}...")
+                        self.logger.info(f"  ⚠️  Only {time_to_expiry:.0f} min left < {self.config.min_time_to_expiry_minutes} min threshold")
+                        await self.cancel_old_orders(market_id)
+                        del self.markets[market_id]
+                        continue
+                
                 # Проверяем нужна ли ребалансировка
                 if state.last_rebalance:
                     elapsed = (datetime.now() - state.last_rebalance).total_seconds()
@@ -1360,6 +1409,8 @@ class MarketMakerBot:
         self.logger.info(f"  Probability filter: {self.config.min_probability:.0%} - {self.config.max_probability:.0%}")
         self.logger.info(f"  Liquidity filter: ${self.config.min_liquidity_usd:.0f} - ${self.config.max_liquidity_usd:.0f}")
         self.logger.info(f"  Rebalance interval: {self.config.rebalance_interval_sec}s")
+        self.logger.info(f"  Market rotation: {self.config.max_market_hold_minutes} min (0=off)")
+        self.logger.info(f"  Min time to expiry: {self.config.min_time_to_expiry_minutes} min")
         self.logger.info(f"  Market fallback: {'ON' if self.config.enable_market_fallback else 'OFF'}")
         if self.config.enable_market_fallback:
             self.logger.info(f"  Max market loss: {self.config.max_market_loss_percent:.1f}%")
@@ -1477,6 +1528,10 @@ def load_config() -> BotConfig:
         config.enable_market_fallback = os.getenv("ENABLE_MARKET_FALLBACK", "").lower() in ("true", "1", "yes")
     if os.getenv("MAX_MARKET_LOSS_PERCENT"):
         config.max_market_loss_percent = float(os.getenv("MAX_MARKET_LOSS_PERCENT"))
+    if os.getenv("MAX_MARKET_HOLD_MINUTES"):
+        config.max_market_hold_minutes = int(os.getenv("MAX_MARKET_HOLD_MINUTES"))
+    if os.getenv("MIN_TIME_TO_EXPIRY_MINUTES"):
+        config.min_time_to_expiry_minutes = int(os.getenv("MIN_TIME_TO_EXPIRY_MINUTES"))
     
     return config
 
