@@ -232,6 +232,10 @@ class BotConfig:
     max_orders_per_market: int = 2       # Макс. ордеров на сторону (YES/NO)
     aggressive_pricing: bool = False     # True = ставить ордера ближе к рынку (0.5% spread)
     
+    # Position growth control / Контроль роста позиции
+    stop_new_orders_after_fill: bool = True  # НЕ выставлять новые лимитки если уже есть позиция
+                                              # (только хеджировать, не наращивать позицию)
+    
     # Timing / Тайминги
     rebalance_interval_sec: int = 1200   # Интервал ребалансировки (20 минут - больше времени для fill!)
     price_change_threshold: float = 0.02 # Порог изменения цены для ребалансировки (2%)
@@ -1197,6 +1201,14 @@ class MarketMakerBot:
                 self.logger.info(f"  ⏭️  Skipping: market has unhedged position (hedge only)")
                 return []
             
+            # НОВОЕ: Проверяем есть ли ЛЮБАЯ позиция (включая delta-neutral)
+            # Если stop_new_orders_after_fill включен - не выставляем новые лимитки
+            if self.config.stop_new_orders_after_fill:
+                has_any_position = await self._has_any_position(market.market_id)
+                if has_any_position:
+                    self.logger.info(f"  ⏭️  Skipping: already have position (stop_new_orders_after_fill=True)")
+                    return []
+            
             # ВАЖНО: Перед размещением ордеров проверяем существующие позиции на бирже
             # Это нужно для случаев когда рынок был удалён из tracking (ротация),
             # но позиция на бирже осталась
@@ -1434,6 +1446,41 @@ class MarketMakerBot:
         if total_cost <= 1.0:
             return 0.0  # Нет убытка, есть профит
         return (total_cost - 1.0) * 100  # Убыток в %
+    
+    async def _has_any_position(self, market_id: str) -> bool:
+        """
+        Проверить есть ли ЛЮБАЯ позиция на рынке (включая delta-neutral)
+        
+        Используется для stop_new_orders_after_fill - если уже есть позиция,
+        не выставлять новые лимитки чтобы не наращивать позицию.
+        
+        Returns:
+            True если есть позиция с value > $0.5
+        """
+        try:
+            positions = await self.graphql_client.get_positions()
+            if not positions:
+                return False
+            
+            for pos in positions:
+                market_info = pos.get("market", {})
+                pos_market_id = str(pos.get("marketId") or market_info.get("id") or "")
+                
+                if pos_market_id == market_id:
+                    value_raw = pos.get("valueUsd") or 0
+                    try:
+                        value = float(str(value_raw).replace(",", "."))
+                    except:
+                        value = 0
+                    
+                    if value > 0.5:  # Минимальный порог $0.5
+                        return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.debug(f"_has_any_position error: {e}")
+            return False
     
     async def _check_existing_position(self, market: MarketData) -> Optional[tuple[dict, OutcomeData]]:
         """
@@ -2382,6 +2429,7 @@ class MarketMakerBot:
         self.logger.info(f"  Order size: ${self.config.order_size_usd:.2f}")
         self.logger.info(f"  Target spread: {self.config.target_spread:.1%}")
         self.logger.info(f"  Aggressive pricing: {'ON (0.5% spread)' if self.config.aggressive_pricing else 'OFF'}")
+        self.logger.info(f"  Stop orders after fill: {'ON (hedge only)' if self.config.stop_new_orders_after_fill else 'OFF (allow growth)'}")
         self.logger.info(f"  Max position: ${self.config.max_position_usd:.2f}")
         self.logger.info(f"  Probability filter: {self.config.min_probability:.0%} - {self.config.max_probability:.0%}")
         self.logger.info(f"  Liquidity filter: ${self.config.min_liquidity_usd:.0f} - ${self.config.max_liquidity_usd:.0f}")
@@ -2538,6 +2586,8 @@ def load_config() -> BotConfig:
         config.skip_rebalance_if_price_stable = os.getenv("SKIP_REBALANCE_IF_PRICE_STABLE", "").lower() in ("true", "1", "yes")
     if os.getenv("PRICE_CHANGE_THRESHOLD"):
         config.price_change_threshold = float(os.getenv("PRICE_CHANGE_THRESHOLD"))
+    if os.getenv("STOP_NEW_ORDERS_AFTER_FILL"):
+        config.stop_new_orders_after_fill = os.getenv("STOP_NEW_ORDERS_AFTER_FILL", "").lower() in ("true", "1", "yes")
     
     return config
 
