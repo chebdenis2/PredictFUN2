@@ -236,6 +236,10 @@ class BotConfig:
     stop_new_orders_after_fill: bool = True  # НЕ выставлять новые лимитки если уже есть позиция
                                               # (только хеджировать, не наращивать позицию)
     
+    # Hedge order settings / Настройки хеджирующих ордеров
+    hedge_price_slippage: float = 0.05       # Slippage для hedge ордеров (5% выше ask для быстрого исполнения)
+                                              # ask_price * (1 + slippage) = aggressive price
+    
     # Timing / Тайминги
     rebalance_interval_sec: int = 1200   # Интервал ребалансировки (20 минут - больше времени для fill!)
     price_change_threshold: float = 0.02 # Порог изменения цены для ребалансировки (2%)
@@ -1060,6 +1064,31 @@ class MarketMakerBot:
             self.logger.error(f"❌ Error fetching markets: {e}")
             return []
     
+    def _get_aggressive_hedge_price(self, ask_price: Optional[Decimal]) -> Decimal:
+        """
+        Рассчитать агрессивную цену для hedge ордера
+        
+        Добавляем slippage к ask_price чтобы ордер исполнился быстро.
+        Цена ограничена максимумом 0.99 (99 центов).
+        
+        Args:
+            ask_price: Текущая цена продавца (ask)
+            
+        Returns:
+            Aggressive price = ask * (1 + slippage), но не больше 0.99
+        """
+        if ask_price is None or float(ask_price) <= 0:
+            return Decimal("0.50")  # Default price if no ask
+        
+        # Добавляем slippage для быстрого исполнения
+        aggressive = float(ask_price) * (1 + self.config.hedge_price_slippage)
+        
+        # Ограничиваем максимумом 0.99
+        aggressive = min(aggressive, 0.99)
+        
+        # Округляем до 4 знаков
+        return Decimal(str(round(aggressive, 4)))
+    
     def _is_market_suitable(self, market: MarketData) -> bool:
         """Проверить подходит ли рынок"""
         # Проверяем статус
@@ -1301,16 +1330,18 @@ class MarketMakerBot:
                 self.logger.info(f"  ⚠️  Found existing position: {position_info['name']} ${position_info['value_usd']:.2f}")
                 self.logger.info(f"  🛡️ Placing hedge order instead of delta-neutral pair")
                 
-                # Размещаем только hedge ордер
-                market_price = float(other_outcome.ask_price) if other_outcome.ask_price else 0.5
+                # Размещаем только hedge ордер с АГРЕССИВНОЙ ценой (ask + slippage)
+                aggressive_price = self._get_aggressive_hedge_price(other_outcome.ask_price)
                 size_usd = position_info['value_usd']
-                size_wei = int(Decimal(str(size_usd / market_price)) * WEI_MULTIPLIER)
+                size_wei = int(Decimal(str(size_usd / float(aggressive_price))) * WEI_MULTIPLIER)
+                
+                self.logger.info(f"  🚀 Aggressive hedge: ask={other_outcome.ask_price} → price={aggressive_price} (+{self.config.hedge_price_slippage:.0%} slippage)")
                 
                 order = await self._place_single_order(
                     market=market,
                     outcome=other_outcome,
                     side=Side.BUY,
-                    price=Decimal(str(market_price)),
+                    price=aggressive_price,
                     size_wei=size_wei
                 )
                 
@@ -1748,22 +1779,23 @@ class MarketMakerBot:
                 if not other_outcome or not other_outcome.on_chain_id:
                     return False
                 
-                # Размещаем hedge ордер
-                market_price = float(other_outcome.ask_price) if other_outcome.ask_price else 0.5
+                # Размещаем hedge ордер с АГРЕССИВНОЙ ценой
+                aggressive_price = self._get_aggressive_hedge_price(other_outcome.ask_price)
                 size_usd = filled_pos['value_usd']
-                size_wei = int(Decimal(str(size_usd / market_price)) * WEI_MULTIPLIER)
+                size_wei = int(Decimal(str(size_usd / float(aggressive_price))) * WEI_MULTIPLIER)
                 
                 self.logger.info(f"  🛡️ Position needs hedge: {filled_pos['name']} ${size_usd:.2f} → placing {other_outcome.name} order")
+                self.logger.info(f"  🚀 Aggressive hedge: ask={other_outcome.ask_price} → price={aggressive_price} (+{self.config.hedge_price_slippage:.0%} slippage)")
                 
                 order = await self._place_single_order(
                     market=market,
                     outcome=other_outcome,
                     side=Side.BUY,
-                    price=Decimal(str(market_price)),
+                    price=aggressive_price,
                     size_wei=size_wei
                 )
                 if order:
-                    self.logger.info(f"  ✅ Hedge order placed: {other_outcome.name} @ ${market_price:.4f}")
+                    self.logger.info(f"  ✅ Hedge order placed: {other_outcome.name} @ ${float(aggressive_price):.4f}")
                     return True  # Hedge размещён, не нужны доп. лимитки
                 
                 return False  # Не удалось разместить hedge
@@ -1904,20 +1936,22 @@ class MarketMakerBot:
                         state.has_unhedged_position = True
                         state.market = updated or state.market
                         
-                        # Размещаем hedge ордер
-                        market_price = float(other_outcome.ask_price) if other_outcome.ask_price else 0.5
+                        # Размещаем hedge ордер с АГРЕССИВНОЙ ценой
+                        aggressive_price = self._get_aggressive_hedge_price(other_outcome.ask_price)
                         size_usd = position_info['value_usd']
-                        size_wei = int(Decimal(str(size_usd / market_price)) * WEI_MULTIPLIER)
+                        size_wei = int(Decimal(str(size_usd / float(aggressive_price))) * WEI_MULTIPLIER)
+                        
+                        self.logger.info(f"  🚀 Aggressive hedge: ask={other_outcome.ask_price} → price={aggressive_price} (+{self.config.hedge_price_slippage:.0%} slippage)")
                         
                         order = await self._place_single_order(
                             market=state.market,
                             outcome=other_outcome,
                             side=Side.BUY,
-                            price=Decimal(str(market_price)),
+                            price=aggressive_price,
                             size_wei=size_wei
                         )
                         if order:
-                            self.logger.info(f"  ✅ Hedge order placed: {other_outcome.name} @ ${market_price:.4f}")
+                            self.logger.info(f"  ✅ Hedge order placed: {other_outcome.name} @ ${float(aggressive_price):.4f}")
                         
                         state.last_rebalance = datetime.now()
                     else:
@@ -2287,22 +2321,23 @@ class MarketMakerBot:
                 self.logger.info(f"    ✅ Hedge order already exists for {other_outcome.name} - skipping")
                 return
             
-            # Текущая рыночная цена другой стороны (ask price)
-            market_price = float(other_outcome.ask_price) if other_outcome.ask_price else 0.5
+            # Текущая рыночная цена другой стороны (ask price) + slippage для быстрого исполнения
+            aggressive_price = self._get_aggressive_hedge_price(other_outcome.ask_price)
+            base_ask = float(other_outcome.ask_price) if other_outcome.ask_price else 0.5
             
-            # Рассчитываем убыток при рыночном входе
+            # Рассчитываем убыток при агрессивном входе
             filled_price = Decimal(str(filled_pos['entry_price']))
-            loss_percent = self._calculate_market_entry_loss(filled_price, Decimal(str(market_price)))
+            loss_percent = self._calculate_market_entry_loss(filled_price, aggressive_price)
             
-            self.logger.info(f"    Hedge target: {other_outcome.name} @ ${market_price:.4f} (ask)")
-            self.logger.info(f"    Entry + Market = ${float(filled_price) + market_price:.4f} | Loss: {loss_percent:.2f}%")
+            self.logger.info(f"    Hedge target: {other_outcome.name} @ ${float(aggressive_price):.4f} (ask={base_ask:.4f} +{self.config.hedge_price_slippage:.0%} slippage)")
+            self.logger.info(f"    Entry + Market = ${float(filled_price) + float(aggressive_price):.4f} | Loss: {loss_percent:.2f}%")
             
             # Минимальный размер ордера на Predict.fun = $0.9
             MIN_ORDER_VALUE_USD = 0.9
             
             if loss_percent <= self.config.max_market_loss_percent:
-                # Входим по рынку - убыток приемлемый
-                self.logger.info(f"    ✅ Loss {loss_percent:.2f}% <= {self.config.max_market_loss_percent}%, entering at MARKET")
+                # Входим по агрессивной цене - убыток приемлемый
+                self.logger.info(f"    ✅ Loss {loss_percent:.2f}% <= {self.config.max_market_loss_percent}%, entering at AGGRESSIVE price")
                 
                 # Размер = стоимость первой позиции, чтобы суммы были равны
                 size_usd = filled_pos['value_usd'] if filled_pos['value_usd'] > 0 else (filled_pos['quantity'] * filled_pos['entry_price'])
@@ -2312,17 +2347,17 @@ class MarketMakerBot:
                     self.logger.warning(f"    ⚠️  Position value ${size_usd:.2f} < min ${MIN_ORDER_VALUE_USD} - skipping hedge")
                     return
                 
-                size_wei = int(Decimal(str(size_usd / market_price)) * WEI_MULTIPLIER)
+                size_wei = int(Decimal(str(size_usd / float(aggressive_price))) * WEI_MULTIPLIER)
                 
                 order = await self._place_single_order(
                     market=market,
                     outcome=other_outcome,
                     side=Side.BUY,
-                    price=Decimal(str(market_price)),
+                    price=aggressive_price,
                     size_wei=size_wei
                 )
                 if order:
-                    self.logger.info(f"    ✅ Hedge MARKET order placed for ${size_usd:.2f}!")
+                    self.logger.info(f"    ✅ Hedge AGGRESSIVE order placed for ${size_usd:.2f}!")
                     # ВАЖНО: добавляем рынок в tracking чтобы не размещать дубли
                     if market_id not in self.markets:
                         self.markets[market_id] = MarketState(
@@ -2485,17 +2520,19 @@ class MarketMakerBot:
                     self.logger.info(f"  ✅ Hedge order already exists for {other_outcome.name}")
                     return
             
-            # Размещаем hedge
-            market_price = float(other_outcome.ask_price) if other_outcome.ask_price else 0.5
-            size_wei = int(Decimal(str(filled_value / market_price)) * WEI_MULTIPLIER)
+            # Размещаем hedge с АГРЕССИВНОЙ ценой
+            aggressive_price = self._get_aggressive_hedge_price(other_outcome.ask_price)
+            base_ask = float(other_outcome.ask_price) if other_outcome.ask_price else 0.5
+            size_wei = int(Decimal(str(filled_value / float(aggressive_price))) * WEI_MULTIPLIER)
             
-            self.logger.info(f"  🛡️ Hedging orphaned {filled_name} ${filled_value:.2f} → {other_outcome.name} @ ${market_price:.4f}")
+            self.logger.info(f"  🛡️ Hedging orphaned {filled_name} ${filled_value:.2f} → {other_outcome.name} @ ${float(aggressive_price):.4f}")
+            self.logger.info(f"  🚀 Aggressive: ask={base_ask:.4f} → price={float(aggressive_price):.4f} (+{self.config.hedge_price_slippage:.0%} slippage)")
             
             order = await self._place_single_order(
                 market=market,
                 outcome=other_outcome,
                 side=Side.BUY,
-                price=Decimal(str(market_price)),
+                price=aggressive_price,
                 size_wei=size_wei
             )
             
@@ -2550,6 +2587,7 @@ class MarketMakerBot:
         self.logger.info(f"  Target spread: {self.config.target_spread:.1%}")
         self.logger.info(f"  Aggressive pricing: {'ON (0.5% spread)' if self.config.aggressive_pricing else 'OFF'}")
         self.logger.info(f"  Stop orders after fill: {'ON (hedge only)' if self.config.stop_new_orders_after_fill else 'OFF (allow growth)'}")
+        self.logger.info(f"  Hedge slippage: {self.config.hedge_price_slippage:.0%} (ask + slippage for fast execution)")
         self.logger.info(f"  Max position: ${self.config.max_position_usd:.2f}")
         self.logger.info(f"  Probability filter: {self.config.min_probability:.0%} - {self.config.max_probability:.0%}")
         self.logger.info(f"  Liquidity filter: ${self.config.min_liquidity_usd:.0f} - ${self.config.max_liquidity_usd:.0f}")
@@ -2708,6 +2746,8 @@ def load_config() -> BotConfig:
         config.price_change_threshold = float(os.getenv("PRICE_CHANGE_THRESHOLD"))
     if os.getenv("STOP_NEW_ORDERS_AFTER_FILL"):
         config.stop_new_orders_after_fill = os.getenv("STOP_NEW_ORDERS_AFTER_FILL", "").lower() in ("true", "1", "yes")
+    if os.getenv("HEDGE_PRICE_SLIPPAGE"):
+        config.hedge_price_slippage = float(os.getenv("HEDGE_PRICE_SLIPPAGE"))
     
     return config
 
