@@ -1069,25 +1069,21 @@ class MarketMakerBot:
         Рассчитать агрессивную цену для hedge ордера
         
         Добавляем slippage к ask_price чтобы ордер исполнился быстро.
-        Цена ограничена максимумом 0.99 (99 центов).
         
         Args:
             ask_price: Текущая цена продавца (ask)
             
         Returns:
-            Aggressive price = ask * (1 + slippage), но не больше 0.99
+            Aggressive price = ask * (1 + slippage), округлённая ВВЕРХ до 2 знаков
         """
         if ask_price is None or float(ask_price) <= 0:
             return Decimal("0.50")  # Default price if no ask
         
         # Добавляем slippage для быстрого исполнения
-        aggressive = float(ask_price) * (1 + self.config.hedge_price_slippage)
+        aggressive = Decimal(str(float(ask_price) * (1 + self.config.hedge_price_slippage)))
         
-        # Ограничиваем максимумом 0.99
-        aggressive = min(aggressive, 0.99)
-        
-        # Округляем до 4 знаков
-        return Decimal(str(round(aggressive, 4)))
+        # Округляем ВВЕРХ для гарантированного исполнения
+        return self._round_price(aggressive, round_up=True)
     
     def _is_market_suitable(self, market: MarketData) -> bool:
         """Проверить подходит ли рынок"""
@@ -1133,8 +1129,9 @@ class MarketMakerBot:
         spread = Decimal(str(self.config.target_spread))
         order_size = Decimal(str(self.config.order_size_usd))
         
-        bid_price = max(Decimal("0.01"), min(Decimal("0.99"), mid_price - spread))
-        ask_price = max(Decimal("0.01"), min(Decimal("0.99"), mid_price + spread))
+        # Округляем цены до 2 знаков (требование API)
+        bid_price = self._round_price(mid_price - spread, round_up=False)  # Bid ниже - округляем вниз
+        ask_price = self._round_price(mid_price + spread, round_up=True)   # Ask выше - округляем вверх
         
         bid_size_wei = int((order_size / bid_price) * WEI_MULTIPLIER)
         ask_size_wei = int((order_size / ask_price) * WEI_MULTIPLIER)
@@ -1144,6 +1141,27 @@ class MarketMakerBot:
     def price_to_wei(self, price: Decimal) -> int:
         """Convert price to wei"""
         return int(price * WEI_MULTIPLIER)
+    
+    def _round_price(self, price: Decimal, round_up: bool = False) -> Decimal:
+        """
+        Округлить цену до 2 знаков после запятой (требование API!)
+        
+        Args:
+            price: Цена для округления
+            round_up: Если True, округляет вверх (для hedge ордеров)
+            
+        Returns:
+            Цена, округлённая до 2 знаков, в диапазоне [0.01, 0.99]
+        """
+        from decimal import ROUND_UP, ROUND_DOWN
+        
+        rounding = ROUND_UP if round_up else ROUND_DOWN
+        result = price.quantize(Decimal("0.01"), rounding=rounding)
+        
+        # Убеждаемся что цена в допустимых границах
+        result = max(Decimal("0.01"), min(Decimal("0.99"), result))
+        
+        return result
     
     def _quantity_step(self, price_per_share_wei: int) -> int:
         """Calculate quantity step for precision (from working bot)"""
@@ -1406,14 +1424,15 @@ class MarketMakerBot:
             else:
                 spread = Decimal(str(self.config.target_spread))
             
-            bid_price = max(Decimal("0.01"), min(Decimal("0.99"), mid_price - spread))
-            ask_price = max(Decimal("0.01"), min(Decimal("0.99"), mid_price + spread))
+            # Округляем цены до 2 знаков (требование API!)
+            bid_price = self._round_price(mid_price - spread, round_up=False)
+            ask_price = self._round_price(mid_price + spread, round_up=True)
             
             bid_size_wei = int((Decimal(str(order_size)) / bid_price) * WEI_MULTIPLIER)
             ask_size_wei = int((Decimal(str(order_size)) / ask_price) * WEI_MULTIPLIER)
             
-            # Delta-neutral цена для второго исхода
-            outcome_1_price = max(Decimal("0.01"), min(Decimal("0.99"), Decimal("1") - ask_price))
+            # Delta-neutral цена для второго исхода (округляем вниз т.к. это BUY)
+            outcome_1_price = self._round_price(Decimal("1") - ask_price, round_up=False)
             
             self.logger.info(f"  📊 DELTA-NEUTRAL STRATEGY:")
             self.logger.info(f"     Mid price: {mid_price:.4f} (from probability {market.chance_percentage:.0f}%)")
@@ -2370,7 +2389,8 @@ class MarketMakerBot:
                 # Ставим лимитку - убыток слишком большой
                 # Рассчитываем цену лимитки: filled_price + limit_price <= 1 + max_loss%
                 max_limit_price = 1.0 + (self.config.max_market_loss_percent / 100) - float(filled_price)
-                limit_price = Decimal(str(max(0.01, min(0.99, max_limit_price))))
+                # Округляем ВНИЗ т.к. это покупка (хотим дешевле)
+                limit_price = self._round_price(Decimal(str(max(0.01, min(0.99, max_limit_price)))), round_up=False)
                 
                 self.logger.info(f"    📝 Loss {loss_percent:.2f}% > {self.config.max_market_loss_percent}%, placing LIMIT @ ${float(limit_price):.4f}")
                 
