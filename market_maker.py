@@ -382,6 +382,9 @@ class PredictGraphQLClient:
     Использует REST API для авторизации и ордеров.
     """
     
+    # JWT токен живёт ~4 часа, обновляем каждые 3 часа для надёжности
+    JWT_REFRESH_INTERVAL_SEC = 3 * 60 * 60  # 3 hours
+    
     def __init__(
         self, 
         logger: logging.Logger,
@@ -393,6 +396,12 @@ class PredictGraphQLClient:
         self.timeout_sec = timeout_sec
         self.session: Optional[aiohttp.ClientSession] = None
         self.jwt_token: Optional[str] = None  # JWT token for authenticated requests
+        
+        # Для автоматического обновления JWT
+        self._jwt_created_at: Optional[datetime] = None
+        self._predict_account: Optional[str] = None
+        self._order_builder = None  # OrderBuilder для повторной авторизации
+        self._reauth_in_progress: bool = False  # Флаг для избежания рекурсии
         
         self.logger.info(f"🌐 GraphQL URL: {PREDICT_GRAPHQL_URL}")
         self.logger.info(f"🌐 REST URL: {PREDICT_REST_URL}")
@@ -556,11 +565,14 @@ class PredictGraphQLClient:
         except aiohttp.ClientError as e:
             raise Exception(f"REST request failed: {e}")
     
-    async def _rest_request_auth(self, method: str, path: str, payload: dict = None) -> dict:
-        """Make authenticated REST API request"""
+    async def _rest_request_auth(self, method: str, path: str, payload: dict = None, _retry: bool = True) -> dict:
+        """Make authenticated REST API request with auto-refresh JWT"""
         if not self.session:
             timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
             self.session = aiohttp.ClientSession(timeout=timeout)
+        
+        # Проверяем и обновляем JWT если нужно
+        await self._ensure_jwt_valid()
         
         url = f"{PREDICT_REST_URL}{path}"
         headers = self._get_headers(require_auth=True)
@@ -570,6 +582,13 @@ class PredictGraphQLClient:
                 async with self.session.get(url, headers=headers) as response:
                     text = await response.text()
                     self.logger.info(f"    REST response ({response.status}): {text[:300]}")
+                    
+                    # При 401 пытаемся переавторизоваться
+                    if response.status == 401 and _retry:
+                        self.logger.warning("    ⚠️ JWT expired (401), re-authenticating...")
+                        if await self._reauth():
+                            return await self._rest_request_auth(method, path, payload, _retry=False)
+                    
                     if response.status >= 400:
                         raise Exception(f"REST error {response.status}: {text[:200]}")
                     return json.loads(text) if text else {}
@@ -577,6 +596,13 @@ class PredictGraphQLClient:
                 async with self.session.post(url, json=payload, headers=headers) as response:
                     text = await response.text()
                     self.logger.info(f"    REST response ({response.status}): {text[:300]}")
+                    
+                    # При 401 пытаемся переавторизоваться
+                    if response.status == 401 and _retry:
+                        self.logger.warning("    ⚠️ JWT expired (401), re-authenticating...")
+                        if await self._reauth():
+                            return await self._rest_request_auth(method, path, payload, _retry=False)
+                    
                     if response.status >= 400:
                         raise Exception(f"REST error {response.status}: {text[:200]}")
                     return json.loads(text) if text else {}
@@ -638,7 +664,11 @@ class PredictGraphQLClient:
             token = auth_response.get("data", {}).get("token")
             if token:
                 self.jwt_token = token
-                self.logger.info(f"🔐 Logged in successfully via REST!")
+                self._jwt_created_at = datetime.now()
+                # Сохраняем параметры для повторной авторизации
+                self._predict_account = predict_account
+                self._order_builder = order_builder
+                self.logger.info(f"🔐 Logged in successfully via REST! (token valid for ~4h)")
                 return True
             else:
                 self.logger.error(f"No token in auth response: {auth_response}")
@@ -649,6 +679,54 @@ class PredictGraphQLClient:
             import traceback
             self.logger.error(traceback.format_exc())
             return False
+    
+    async def _ensure_jwt_valid(self) -> bool:
+        """
+        Проверить и обновить JWT токен если он скоро истечёт
+        
+        Returns:
+            True если токен валиден (или успешно обновлён)
+        """
+        if self._reauth_in_progress:
+            return bool(self.jwt_token)
+        
+        # Если нет токена или времени создания - нужна авторизация
+        if not self.jwt_token or not self._jwt_created_at:
+            if self._predict_account and self._order_builder:
+                self.logger.info("🔄 JWT token missing, re-authenticating...")
+                return await self._reauth()
+            return False
+        
+        # Проверяем возраст токена
+        age_sec = (datetime.now() - self._jwt_created_at).total_seconds()
+        
+        # Если токен старше порога - обновляем
+        if age_sec >= self.JWT_REFRESH_INTERVAL_SEC:
+            self.logger.info(f"🔄 JWT token age {age_sec/3600:.1f}h >= {self.JWT_REFRESH_INTERVAL_SEC/3600:.1f}h, refreshing...")
+            return await self._reauth()
+        
+        return True
+    
+    async def _reauth(self) -> bool:
+        """Повторная авторизация"""
+        if self._reauth_in_progress:
+            return bool(self.jwt_token)
+        
+        if not self._predict_account or not self._order_builder:
+            self.logger.error("Cannot re-authenticate: missing credentials")
+            return False
+        
+        self._reauth_in_progress = True
+        try:
+            self.logger.info("🔐 Re-authenticating...")
+            result = await self.login_rest(self._predict_account, self._order_builder)
+            if result:
+                self.logger.info("✅ Re-authentication successful!")
+            else:
+                self.logger.error("❌ Re-authentication failed!")
+            return result
+        finally:
+            self._reauth_in_progress = False
     
     async def create_order_rest(self, order_payload: dict) -> dict:
         """
@@ -686,10 +764,14 @@ class PredictGraphQLClient:
             self.logger.error(f"    REST order error: {e}")
             raise
     
-    async def get_positions(self) -> list[dict]:
+    async def get_positions(self) -> Optional[list[dict]]:
         """
         Получить открытые позиции через REST API
         GET /v1/positions
+        
+        Returns:
+            list[dict] - список позиций
+            None - при ошибке API (чтобы различать "нет позиций" от "ошибка")
         
         Response format:
         {
@@ -710,10 +792,11 @@ class PredictGraphQLClient:
             response = await self._rest_request_auth("GET", "/v1/positions")
             if response.get("success"):
                 return response.get("data", [])
-            return []
+            self.logger.warning(f"get_positions: API returned success=false")
+            return None  # API ошибка, не пустой список
         except Exception as e:
             self.logger.warning(f"Failed to get positions: {e}")
-            return []
+            return None  # При ошибке возвращаем None, а не пустой список
     
     async def get_open_orders(self, status: str = "OPEN") -> list[dict]:
         """
@@ -1486,11 +1569,20 @@ class MarketMakerBot:
         """
         Проверить есть ли существующая незахеджированная позиция на рынке
         
-        Возвращает (position_info, opposite_outcome) если нужен hedge,
-        None если позиции нет или уже delta-neutral
+        Возвращает:
+            (position_info, opposite_outcome) если нужен hedge
+            None если позиции нет или уже delta-neutral
+            
+        Raises:
+            Exception при ошибке API (чтобы не удалять рынок при проблемах с сетью)
         """
         try:
             positions = await self.graphql_client.get_positions()
+            
+            # None означает ошибку API - не можем определить состояние позиции
+            if positions is None:
+                raise Exception("API error: cannot determine position state")
+            
             if not positions:
                 return None
             
@@ -1718,18 +1810,28 @@ class MarketMakerBot:
                         
                         # ВАЖНО: Перед удалением проверяем есть ли незахеджированная позиция
                         # Если есть - оставляем в tracking и размещаем/обновляем hedge
-                        existing_position = await self._check_existing_position(state.market)
-                        if existing_position:
-                            position_info, other_outcome = existing_position
-                            self.logger.info(f"  ⚠️  Has unhedged position: {position_info['name']} ${position_info['value_usd']:.2f}")
-                            self.logger.info(f"  🛡️ Keeping market for hedge management (not rotating)")
-                            state.has_unhedged_position = True
-                            # Не удаляем рынок - нужно поддерживать hedge
+                        try:
+                            existing_position = await self._check_existing_position(state.market)
+                            if existing_position:
+                                position_info, other_outcome = existing_position
+                                self.logger.info(f"  ⚠️  Has unhedged position: {position_info['name']} ${position_info['value_usd']:.2f}")
+                                self.logger.info(f"  🛡️ Keeping market for hedge management (not rotating)")
+                                state.has_unhedged_position = True
+                                # Не удаляем рынок - нужно поддерживать hedge
+                                continue
+                            
+                            # Если рынок уже помечен как hedge-only, не удаляем его
+                            if state.has_unhedged_position:
+                                self.logger.info(f"  🛡️ Keeping hedge-only market (not rotating)")
+                                continue
+                            
+                            await self.cancel_old_orders(market_id)
+                            del self.markets[market_id]
                             continue
-                        
-                        await self.cancel_old_orders(market_id)
-                        del self.markets[market_id]
-                        continue
+                        except Exception as e:
+                            # При ошибке API не удаляем рынок
+                            self.logger.warning(f"  ⚠️ Cannot verify position (API error), keeping market: {e}")
+                            continue
                 
                 # Проверяем время до экспирации
                 if state.market.ends_at and self.config.min_time_to_expiry_minutes > 0:
@@ -1820,13 +1922,23 @@ class MarketMakerBot:
                         state.last_rebalance = datetime.now()
                     else:
                         # Нет позиции - можно безопасно удалить
-                        self.logger.info(f"  📤 Market no longer suitable (no position), removing...")
-                        del self.markets[market_id]
+                        # НО: не удаляем если рынок помечен как hedge-only (has_unhedged_position)
+                        # Это защита от удаления при временных ошибках API
+                        if state.has_unhedged_position:
+                            self.logger.info(f"  ⚠️ Keeping hedge-only market (API may have returned stale data)")
+                            state.last_rebalance = datetime.now()
+                        else:
+                            self.logger.info(f"  📤 Market no longer suitable (no position), removing...")
+                            del self.markets[market_id]
                 
                 await asyncio.sleep(self.config.api_delay_sec)
                 
             except Exception as e:
+                # При ошибках API НЕ удаляем рынок - лучше оставить в tracking
                 self.logger.error(f"❌ Rebalance error for {market_id}: {e}")
+                # Обновляем last_rebalance чтобы не спамить запросами
+                if market_id in self.markets:
+                    self.markets[market_id].last_rebalance = datetime.now()
     
     async def _recover_open_orders(self) -> set[str]:
         """
@@ -2414,6 +2526,14 @@ class MarketMakerBot:
         
         active = sum(1 for o in self.active_orders.values() if o.status == OrderStatus.OPEN)
         self.logger.info(f"  Active orders: {active}")
+        
+        # Показываем JWT статус
+        jwt_created = self.graphql_client._jwt_created_at
+        if jwt_created:
+            age_min = (datetime.now() - jwt_created).total_seconds() / 60
+            self.logger.info(f"  🔐 JWT age: {age_min:.0f} min (refresh at {self.graphql_client.JWT_REFRESH_INTERVAL_SEC/60:.0f} min)")
+        else:
+            self.logger.warning(f"  ⚠️ JWT not set!")
         
         # Показываем hedge-only рынки если есть
         if hedge_only_markets > 0:
