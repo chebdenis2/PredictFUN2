@@ -2080,6 +2080,91 @@ class MarketMakerBot:
             self.logger.debug(traceback.format_exc())
             return markets_with_orders
     
+    async def _sync_orders_with_exchange(self) -> int:
+        """
+        Синхронизировать локальное состояние ордеров с биржей.
+        
+        Проблема: Когда ордера истекают (expiry) на бирже, бот об этом не узнаёт
+        и продолжает считать что hedge ордера активны. Это приводит к тому что
+        позиции остаются незахеджированными.
+        
+        Решение: Периодически получать список открытых ордеров с биржи и 
+        удалять из локального состояния те, которых больше нет.
+        
+        Returns:
+            Количество рынков, у которых пропали ордера (требуют проверки hedge)
+        """
+        markets_needing_hedge_check: set[str] = set()
+        
+        try:
+            # 1. Получаем актуальные открытые ордера с биржи
+            exchange_orders = await self.graphql_client.get_open_orders("OPEN")
+            
+            # 2. Создаём set актуальных order_id
+            active_order_ids: set[str] = set()
+            for order_wrapper in (exchange_orders or []):
+                order = order_wrapper.get("order", order_wrapper)
+                order_id = str(order_wrapper.get("id", order.get("id", order.get("orderId", ""))))
+                if order_id:
+                    active_order_ids.add(order_id)
+            
+            # 3. Проверяем наши локальные ордера
+            # 3a. Очищаем active_orders от экспайренных
+            expired_order_ids: list[str] = []
+            for order_id in list(self.active_orders.keys()):
+                if order_id not in active_order_ids:
+                    expired_order_ids.append(order_id)
+                    market_id = self.active_orders[order_id].market_id
+                    if market_id:
+                        markets_needing_hedge_check.add(market_id)
+                    del self.active_orders[order_id]
+            
+            # 3b. Очищаем our_orders в каждом MarketState от экспайренных
+            for market_id, state in self.markets.items():
+                original_count = len(state.our_orders)
+                # Фильтруем - оставляем только те ордера, которые есть на бирже
+                state.our_orders = [
+                    o for o in state.our_orders 
+                    if o.order_id in active_order_ids
+                ]
+                removed_count = original_count - len(state.our_orders)
+                
+                if removed_count > 0:
+                    self.logger.info(f"🔄 SYNC: {state.market.title[:40]}...")
+                    self.logger.info(f"  ⚠️ {removed_count} order(s) expired/removed on exchange")
+                    markets_needing_hedge_check.add(market_id)
+                    self.stats['cancelled'] += removed_count  # Считаем как отменённые
+            
+            if expired_order_ids:
+                self.logger.info(f"🔄 Order sync: {len(expired_order_ids)} expired order(s) removed from tracking")
+            
+            # 4. Для рынков с пропавшими ордерами - проверяем нужен ли hedge
+            for market_id in markets_needing_hedge_check:
+                if market_id not in self.markets:
+                    continue
+                    
+                state = self.markets[market_id]
+                market = state.market
+                
+                # Обновляем данные рынка
+                updated_market = await self.graphql_client.get_market(market_id)
+                if updated_market:
+                    state.market = updated_market
+                    market = updated_market
+                
+                # Проверяем есть ли незахеджированная позиция
+                hedge_placed = await self._ensure_position_hedged(market_id, market)
+                
+                if hedge_placed:
+                    self.logger.info(f"  ✅ Re-placed hedge order for {market.title[:30]}...")
+                    state.has_unhedged_position = True  # Пометить как hedge-only
+                
+            return len(markets_needing_hedge_check)
+            
+        except Exception as e:
+            self.logger.warning(f"⚠️ Order sync error: {e}")
+            return 0
+    
     async def _recover_positions(self) -> None:
         """
         Восстановить позиции при перезапуске бота
@@ -2674,6 +2759,10 @@ class MarketMakerBot:
                             
                             await self.place_limit_orders(market)
                             await asyncio.sleep(self.config.api_delay_sec)
+                        
+                        # ВАЖНО: Синхронизируем локальные ордера с биржей
+                        # Это отслеживает экспирацию ордеров и переставляет hedge
+                        await self._sync_orders_with_exchange()
                         
                         # Ребалансировка существующих позиций
                         await self._rebalance_existing_markets()
