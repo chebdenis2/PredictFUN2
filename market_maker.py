@@ -251,6 +251,12 @@ class BotConfig:
     passive_spread: float = 0.25             # PASSIVE: 25% - ордера почти никогда не исполнятся
     balanced_spread: float = 0.10            # BALANCED: 10% - редкие исполнения, хорошие поинты
     
+    # 📊 ORDERBOOK LEVELS MODE - позиционирование по уровням стакана
+    # Вместо % отступа от mid-price, ставим ордер на N уровней позади лучшей цены
+    use_orderbook_levels: bool = True        # Использовать уровни стакана вместо % spread
+    levels_behind: int = 3                   # На сколько уровней ниже лучшего bid ставить ордер
+    min_level_spread: float = 0.01           # Мин. отступ от лучшей цены если стакан пустой (1%)
+    
     # 🛡️ ЗАЩИТА ОТ ИСПОЛНЕНИЯ (для PASSIVE_POINTS и BALANCED)
     # Отменяем ордера если цена приблизилась слишком близко
     cancel_when_price_close: bool = True     # Включить защитную отмену
@@ -853,6 +859,61 @@ class PredictGraphQLClient:
             self.logger.warning(f"Failed to get orders: {e}")
             return []
     
+    async def get_orderbook(self, market_id: str) -> Optional[dict]:
+        """
+        Получить orderbook (стакан ордеров) для рынка
+        
+        Returns:
+            {
+                "bids": [{"price": 0.48, "size": 100}, ...],  # Покупатели (от высокой к низкой)
+                "asks": [{"price": 0.52, "size": 100}, ...]   # Продавцы (от низкой к высокой)
+            }
+            или None при ошибке
+        """
+        try:
+            response = await self._rest_request_auth("GET", f"/v1/orderbook/{market_id}")
+            if not response.get("success"):
+                return None
+            
+            data = response.get("data", {})
+            
+            # Парсим bids и asks
+            bids = []
+            asks = []
+            
+            # Формат может быть разный, пробуем разные варианты
+            raw_bids = data.get("bids") or data.get("buyOrders") or []
+            raw_asks = data.get("asks") or data.get("sellOrders") or []
+            
+            for bid in raw_bids:
+                price = bid.get("price") or bid.get("pricePerShare")
+                size = bid.get("size") or bid.get("quantity") or bid.get("amount")
+                if price:
+                    # Конвертируем из wei если нужно
+                    price_val = float(price)
+                    if price_val > 1:  # Вероятно в wei
+                        price_val = price_val / WEI_MULTIPLIER
+                    bids.append({"price": price_val, "size": float(size or 0)})
+            
+            for ask in raw_asks:
+                price = ask.get("price") or ask.get("pricePerShare")
+                size = ask.get("size") or ask.get("quantity") or ask.get("amount")
+                if price:
+                    price_val = float(price)
+                    if price_val > 1:
+                        price_val = price_val / WEI_MULTIPLIER
+                    asks.append({"price": price_val, "size": float(size or 0)})
+            
+            # Сортируем: bids от высокой к низкой, asks от низкой к высокой
+            bids.sort(key=lambda x: x["price"], reverse=True)
+            asks.sort(key=lambda x: x["price"])
+            
+            return {"bids": bids, "asks": asks}
+            
+        except Exception as e:
+            self.logger.debug(f"Failed to get orderbook: {e}")
+            return None
+    
     async def cancel_orders_rest(self, order_ids: list[str]) -> bool:
         """
         Отменить ордера через REST API
@@ -1102,6 +1163,62 @@ class MarketMakerBot:
         
         # Округляем ВВЕРХ для гарантированного исполнения
         return self._round_price(aggressive, round_up=True)
+    
+    async def _get_price_from_orderbook(
+        self, 
+        market_id: str, 
+        side: str,  # "bid" или "ask"
+        levels_behind: int
+    ) -> Optional[Decimal]:
+        """
+        Получить цену на N уровней позади лучшей в стакане
+        
+        Args:
+            market_id: ID рынка
+            side: "bid" для покупки (смотрим bids), "ask" для другой стороны
+            levels_behind: На сколько уровней позади лучшей цены
+            
+        Returns:
+            Цена на нужном уровне или None если стакан пустой
+        """
+        try:
+            orderbook = await self.graphql_client.get_orderbook(market_id)
+            if not orderbook:
+                return None
+            
+            orders = orderbook.get("bids" if side == "bid" else "asks", [])
+            
+            if not orders:
+                self.logger.debug(f"  📊 Orderbook {side}s empty for {market_id}")
+                return None
+            
+            # Логируем стакан для отладки
+            self.logger.info(f"  📊 Orderbook {side}s: {len(orders)} levels")
+            for i, order in enumerate(orders[:5]):  # Первые 5 уровней
+                self.logger.info(f"     Level {i+1}: ${order['price']:.4f} ({order['size']:.0f} shares)")
+            
+            # Выбираем уровень
+            target_level = min(levels_behind, len(orders)) - 1
+            if target_level < 0:
+                target_level = 0
+            
+            target_price = orders[target_level]["price"]
+            
+            # Для bid - ставим НИЖЕ целевого уровня (чтобы быть позади)
+            # Для ask - ставим ВЫШЕ целевого уровня
+            if side == "bid":
+                # Один цент ниже чтобы быть позади
+                final_price = target_price - 0.01
+            else:
+                final_price = target_price + 0.01
+            
+            self.logger.info(f"  🎯 Target: level {target_level + 1} @ ${target_price:.4f} → our price: ${final_price:.4f}")
+            
+            return self._round_price(Decimal(str(final_price)), round_up=(side == "ask"))
+            
+        except Exception as e:
+            self.logger.debug(f"  Orderbook price error: {e}")
+            return None
     
     def _is_market_suitable(self, market: MarketData) -> bool:
         """Проверить подходит ли рынок"""
@@ -1466,15 +1583,53 @@ class MarketMakerBot:
                 # =====================================================
                 # ⚖️ BALANCED: Оптимальный баланс риск/поинты (РЕКОМЕНДУЕТСЯ!)
                 # =====================================================
-                # Spread 10% - достаточно близко для поинтов, но исполнения редки
-                # Если исполнится - потеря ~10%, но это редко происходит
-                spread = Decimal(str(self.config.balanced_spread))  # 10% по умолчанию
                 
-                self.logger.info(f"  ⚖️ BALANCED MODE: {float(spread):.0%} spread")
-                self.logger.info(f"  💰 Good points, rare fills, moderate risk")
-                
-                bid_price = self._round_price(mid_price - spread, round_up=False)
-                outcome_1_price = self._round_price(Decimal("1") - mid_price - spread, round_up=False)
+                # 📊 НОВОЕ: Используем уровни стакана вместо % spread
+                if self.config.use_orderbook_levels:
+                    self.logger.info(f"  📊 ORDERBOOK LEVELS MODE: {self.config.levels_behind} levels behind best price")
+                    
+                    # Получаем цену из orderbook для outcome_0
+                    ob_bid_price = await self._get_price_from_orderbook(
+                        market.market_id, 
+                        "bid", 
+                        self.config.levels_behind
+                    )
+                    
+                    if ob_bid_price and ob_bid_price > Decimal("0.01"):
+                        bid_price = ob_bid_price
+                        self.logger.info(f"  ✅ {outcome_0.name} price from orderbook: ${float(bid_price):.2f}")
+                    else:
+                        # Fallback на % spread если стакан пустой
+                        spread = Decimal(str(self.config.min_level_spread))
+                        bid_price = self._round_price(mid_price - spread, round_up=False)
+                        self.logger.info(f"  ⚠️ {outcome_0.name} orderbook empty, using {float(spread):.0%} spread: ${float(bid_price):.2f}")
+                    
+                    # Для outcome_1 делаем симметрично: 1 - mid_price это mid для NO
+                    # Но нам нужен orderbook для NO токена, а он другой
+                    # Пока используем симметричную логику
+                    outcome_1_mid = Decimal("1") - mid_price
+                    ob_ask_price = await self._get_price_from_orderbook(
+                        market.market_id,
+                        "bid",  # Для NO тоже смотрим bids т.к. мы покупаем
+                        self.config.levels_behind
+                    )
+                    
+                    if ob_ask_price and ob_ask_price > Decimal("0.01"):
+                        # Корректируем для NO стороны
+                        outcome_1_price = self._round_price(outcome_1_mid - Decimal(str(self.config.min_level_spread)), round_up=False)
+                        self.logger.info(f"  ✅ {outcome_1.name} price: ${float(outcome_1_price):.2f}")
+                    else:
+                        spread = Decimal(str(self.config.min_level_spread))
+                        outcome_1_price = self._round_price(outcome_1_mid - spread, round_up=False)
+                        self.logger.info(f"  ⚠️ {outcome_1.name} using spread: ${float(outcome_1_price):.2f}")
+                else:
+                    # Старая логика с % spread
+                    spread = Decimal(str(self.config.balanced_spread))
+                    self.logger.info(f"  ⚖️ BALANCED MODE: {float(spread):.0%} spread")
+                    self.logger.info(f"  💰 Good points, rare fills, moderate risk")
+                    
+                    bid_price = self._round_price(mid_price - spread, round_up=False)
+                    outcome_1_price = self._round_price(Decimal("1") - mid_price - spread, round_up=False)
                 
                 # Проверяем границы
                 if bid_price < Decimal("0.01"):
@@ -2164,6 +2319,90 @@ class MarketMakerBot:
             import traceback
             self.logger.debug(traceback.format_exc())
             return markets_with_orders
+    
+    async def _check_orderbook_position(self) -> int:
+        """
+        Проверить позицию наших ордеров в стакане
+        Если ордер оказался первым/вторым - переместить его глубже
+        
+        Returns:
+            Количество перемещённых ордеров
+        """
+        if not self.config.use_orderbook_levels:
+            return 0
+        
+        strategy = self.config.strategy_mode.upper()
+        if strategy not in ["PASSIVE_POINTS", "BALANCED"]:
+            return 0
+        
+        moved_count = 0
+        orders_to_cancel = []
+        
+        # Группируем ордера по market_id
+        orders_by_market: dict[str, list[tuple[str, OrderInfo]]] = {}
+        for order_id, order_info in self.active_orders.items():
+            market_id = order_info.market_id
+            if market_id not in orders_by_market:
+                orders_by_market[market_id] = []
+            orders_by_market[market_id].append((order_id, order_info))
+        
+        for market_id, market_orders in orders_by_market.items():
+            try:
+                orderbook = await self.graphql_client.get_orderbook(market_id)
+                if not orderbook:
+                    continue
+                
+                bids = orderbook.get("bids", [])
+                
+                for order_id, order_info in market_orders:
+                    order_price = float(order_info.price)
+                    
+                    # Находим нашу позицию в стакане
+                    our_position = None
+                    for i, bid in enumerate(bids):
+                        if abs(bid["price"] - order_price) < 0.001:
+                            our_position = i + 1  # 1-indexed
+                            break
+                    
+                    if our_position is not None:
+                        # Если мы в топе (меньше levels_behind), нужно переместить
+                        if our_position < self.config.levels_behind:
+                            self.logger.warning(f"  ⚠️ Order {order_id[:8]}... at position {our_position}/{len(bids)} in orderbook!")
+                            self.logger.warning(f"     Price: ${order_price:.2f} | Need to be at level {self.config.levels_behind}+")
+                            
+                            # Определяем новую цену
+                            target_level = min(self.config.levels_behind, len(bids)) - 1
+                            if target_level >= 0 and target_level < len(bids):
+                                new_price = bids[target_level]["price"] - 0.01
+                                if new_price > 0.01:
+                                    self.logger.info(f"     🔄 Moving order from ${order_price:.2f} to ${new_price:.2f}")
+                                    orders_to_cancel.append(order_id)
+                                    moved_count += 1
+                    else:
+                        # Ордер не найден в стакане - может быть уже не наш или другой токен
+                        self.logger.debug(f"     Order {order_id[:8]}... at ${order_price:.2f} not found in orderbook")
+                
+                await asyncio.sleep(self.config.api_delay_sec)
+                
+            except Exception as e:
+                self.logger.debug(f"  Orderbook check error for {market_id}: {e}")
+        
+        # Отменяем ордера которые нужно переместить
+        if orders_to_cancel:
+            self.logger.info(f"  🔄 Cancelling {len(orders_to_cancel)} orders to reposition...")
+            for order_id in orders_to_cancel:
+                if order_id in self.active_orders:
+                    order_info = self.active_orders[order_id]
+                    # Отменяем
+                    await self.graphql_client.cancel_orders_rest([order_info.numeric_id or order_id])
+                    del self.active_orders[order_id]
+                    
+                    # Удаляем из market state
+                    if order_info.market_id in self.market_states:
+                        state = self.market_states[order_info.market_id]
+                        state.our_orders = [o for o in state.our_orders if o.get("hash") != order_id]
+        
+        return moved_count
     
     async def _sync_orders_with_exchange(self) -> int:
         """
@@ -2892,7 +3131,11 @@ class MarketMakerBot:
             self.logger.info(f"  ⚠️ Points efficiency: LOW (orders too far from mid-price)")
         elif strategy == "BALANCED":
             self.logger.info(f"  ⚖️ Strategy: BALANCED (RECOMMENDED - good points, low risk)")
-            self.logger.info(f"  ⚖️ Spread: {self.config.balanced_spread:.0%} (moderate distance)")
+            if self.config.use_orderbook_levels:
+                self.logger.info(f"  📊 Orderbook levels: ON ({self.config.levels_behind} levels behind best price)")
+                self.logger.info(f"  📊 Min spread (fallback): {self.config.min_level_spread:.0%}")
+            else:
+                self.logger.info(f"  ⚖️ Spread: {self.config.balanced_spread:.0%} (moderate distance)")
             self.logger.info(f"  ⚖️ NO hedging of existing positions")
             self.logger.info(f"  💰 Points efficiency: GOOD (closer to mid-price)")
         elif strategy == "MERGE_ON_FILL":
@@ -2976,8 +3219,12 @@ class MarketMakerBot:
                         if price_check_elapsed >= self.config.price_check_interval_sec:
                             # Проверяем не приблизилась ли цена к нашим ордерам
                             cancelled = await self._cancel_orders_if_price_close()
-                            if cancelled > 0:
-                                self.logger.info(f"⚡ Quick price check: cancelled {cancelled} order(s)")
+                            
+                            # 📊 Проверяем позицию в стакане (если use_orderbook_levels)
+                            moved = await self._check_orderbook_position()
+                            
+                            if cancelled > 0 or moved > 0:
+                                self.logger.info(f"⚡ Quick check: cancelled {cancelled}, moved {moved} order(s)")
                             else:
                                 # Heartbeat - показываем что бот работает
                                 active_orders = sum(len(s.our_orders) for s in self.markets.values())
@@ -3120,6 +3367,14 @@ def load_config() -> BotConfig:
         config.passive_spread = float(os.getenv("PASSIVE_SPREAD"))
     if os.getenv("BALANCED_SPREAD"):
         config.balanced_spread = float(os.getenv("BALANCED_SPREAD"))
+    
+    # Orderbook levels settings
+    if os.getenv("USE_ORDERBOOK_LEVELS"):
+        config.use_orderbook_levels = os.getenv("USE_ORDERBOOK_LEVELS", "").lower() in ("true", "1", "yes")
+    if os.getenv("LEVELS_BEHIND"):
+        config.levels_behind = int(os.getenv("LEVELS_BEHIND"))
+    if os.getenv("MIN_LEVEL_SPREAD"):
+        config.min_level_spread = float(os.getenv("MIN_LEVEL_SPREAD"))
     
     # Price protection settings
     if os.getenv("CANCEL_WHEN_PRICE_CLOSE"):
