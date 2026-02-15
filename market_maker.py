@@ -2978,6 +2978,11 @@ class MarketMakerBot:
                             cancelled = await self._cancel_orders_if_price_close()
                             if cancelled > 0:
                                 self.logger.info(f"⚡ Quick price check: cancelled {cancelled} order(s)")
+                            else:
+                                # Heartbeat - показываем что бот работает
+                                active_orders = sum(len(s.our_orders) for s in self.markets.values())
+                                next_rebalance = self.config.rebalance_interval_sec - rebalance_elapsed
+                                self.logger.info(f"👁️ Price check OK | Orders: {active_orders} | Next rebalance: {next_rebalance:.0f}s")
                             last_price_check = now
                         
                         # ===================================================
