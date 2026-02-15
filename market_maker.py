@@ -920,35 +920,54 @@ class PredictGraphQLClient:
             self.logger.debug(f"Failed to get orderbook: {e}")
             return None
     
-    async def cancel_orders_rest(self, order_ids: list[str]) -> bool:
+    async def cancel_orders_rest(self, order_ids: list[str]) -> dict:
         """
         Отменить ордера через REST API
         Cancel orders via REST API
         
         Args:
             order_ids: List of order IDs (numeric, not hashes!) to cancel
+            
+        Returns:
+            dict with keys:
+            - success: bool
+            - removed: list[str] - успешно отменённые
+            - noop: list[str] - уже исполнены/не существуют
         """
+        result = {"success": False, "removed": [], "noop": []}
+        
         if not order_ids:
-            return True
+            result["success"] = True
+            return result
         
         # Filter out empty strings and hashes (API expects numeric IDs)
         valid_ids = [oid for oid in order_ids if oid and not oid.startswith("0x")]
         if not valid_ids:
             self.logger.warning(f"    No valid order IDs to cancel (got: {order_ids})")
-            return False
+            return result
             
         try:
             self.logger.info(f"    Cancelling orders: {valid_ids}")
             payload = {"data": {"ids": valid_ids}}
             response = await self._rest_request_auth("POST", "/v1/orders/remove", payload)
-            return response.get("success", False)
+            
+            result["success"] = response.get("success", False)
+            result["removed"] = response.get("removed", [])
+            result["noop"] = response.get("noop", [])
+            
+            # Логируем noop (скорее всего исполнились!)
+            if result["noop"]:
+                self.logger.warning(f"    ⚠️ Orders already filled/gone: {result['noop']}")
+            
+            return result
         except Exception as e:
             self.logger.warning(f"Cancel orders error: {e}")
-            return False
+            return result
     
     async def cancel_order(self, order_id: str) -> bool:
         """Cancel single order via REST API"""
-        return await self.cancel_orders_rest([order_id])
+        result = await self.cancel_orders_rest([order_id])
+        return result.get("success", False)
     
     async def get_market(self, market_id: str) -> Optional[MarketData]:
         """Получить данные одного рынка / Get single market data"""
@@ -1605,29 +1624,18 @@ class MarketMakerBot:
                         bid_price = ob_bid_price
                         self.logger.info(f"  ✅ {outcome_0.name} price from orderbook: ${float(bid_price):.2f}")
                     else:
-                        # Fallback на % spread если стакан пустой
-                        spread = Decimal(str(self.config.min_level_spread))
+                        # Fallback на balanced_spread если стакан пустой (НЕ min_level_spread!)
+                        spread = Decimal(str(self.config.balanced_spread))
                         bid_price = self._round_price(mid_price - spread, round_up=False)
-                        self.logger.info(f"  ⚠️ {outcome_0.name} orderbook empty, using {float(spread):.0%} spread: ${float(bid_price):.2f}")
+                        self.logger.info(f"  ⚠️ {outcome_0.name} orderbook unavailable, using {float(spread):.0%} spread: ${float(bid_price):.2f}")
                     
-                    # Для outcome_1 делаем симметрично: 1 - mid_price это mid для NO
-                    # Но нам нужен orderbook для NO токена, а он другой
-                    # Пока используем симметричную логику
+                    # Для outcome_1 (NO) используем ту же логику
                     outcome_1_mid = Decimal("1") - mid_price
-                    ob_ask_price = await self._get_price_from_orderbook(
-                        market.market_id,
-                        "bid",  # Для NO тоже смотрим bids т.к. мы покупаем
-                        self.config.levels_behind
-                    )
                     
-                    if ob_ask_price and ob_ask_price > Decimal("0.01"):
-                        # Корректируем для NO стороны
-                        outcome_1_price = self._round_price(outcome_1_mid - Decimal(str(self.config.min_level_spread)), round_up=False)
-                        self.logger.info(f"  ✅ {outcome_1.name} price: ${float(outcome_1_price):.2f}")
-                    else:
-                        spread = Decimal(str(self.config.min_level_spread))
-                        outcome_1_price = self._round_price(outcome_1_mid - spread, round_up=False)
-                        self.logger.info(f"  ⚠️ {outcome_1.name} using spread: ${float(outcome_1_price):.2f}")
+                    # Fallback на balanced_spread - orderbook API не работает
+                    spread = Decimal(str(self.config.balanced_spread))
+                    outcome_1_price = self._round_price(outcome_1_mid - spread, round_up=False)
+                    self.logger.info(f"  ⚠️ {outcome_1.name} using {float(spread):.0%} spread: ${float(outcome_1_price):.2f}")
                 else:
                     # Старая логика с % spread
                     spread = Decimal(str(self.config.balanced_spread))
@@ -2549,13 +2557,22 @@ class MarketMakerBot:
                         orders_to_cancel.append(order.order_id)
                 
                 if orders_to_cancel:
-                    success = await self.graphql_client.cancel_orders_rest(orders_to_cancel)
-                    if success:
-                        cancelled_count += len(orders_to_cancel)
-                        # Удаляем из локального состояния
-                        state.our_orders = [o for o in state.our_orders if o.order_id not in orders_to_cancel]
-                        self.orders_cancelled += len(orders_to_cancel)
-                        self.logger.info(f"   ✅ Cancelled {len(orders_to_cancel)} order(s) - PROTECTED!")
+                    result = await self.graphql_client.cancel_orders_rest(orders_to_cancel)
+                    
+                    # Обрабатываем успешно отменённые
+                    if result["removed"]:
+                        cancelled_count += len(result["removed"])
+                        self.orders_cancelled += len(result["removed"])
+                        self.logger.info(f"   ✅ Cancelled {len(result['removed'])} order(s) - PROTECTED!")
+                    
+                    # Обрабатываем noop (уже исполнились!)
+                    if result["noop"]:
+                        self.logger.warning(f"   ⚠️ {len(result['noop'])} order(s) ALREADY FILLED before cancel!")
+                        self.orders_filled += len(result["noop"])
+                    
+                    # Удаляем ВСЕ из локального состояния (и removed и noop)
+                    all_processed = set(result["removed"]) | set(result["noop"])
+                    state.our_orders = [o for o in state.our_orders if o.order_id not in all_processed]
                 
                 await asyncio.sleep(self.config.api_delay_sec)
             
