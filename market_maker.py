@@ -1358,44 +1358,46 @@ class MarketMakerBot:
             # ВАЖНО: Перед размещением ордеров проверяем существующие позиции на бирже
             # Это нужно для случаев когда рынок был удалён из tracking (ротация),
             # но позиция на бирже осталась
-            existing_position = await self._check_existing_position(market)
-            if existing_position:
-                position_info, other_outcome = existing_position
-                self.logger.info(f"  ⚠️  Found existing position: {position_info['name']} ${position_info['value_usd']:.2f}")
-                self.logger.info(f"  🛡️ Placing hedge order instead of delta-neutral pair")
-                
-                # Размещаем только hedge ордер с АГРЕССИВНОЙ ценой (ask + slippage)
-                aggressive_price = self._get_aggressive_hedge_price(other_outcome.ask_price)
-                size_usd = position_info['value_usd']
-                size_wei = int(Decimal(str(size_usd / float(aggressive_price))) * WEI_MULTIPLIER)
-                
-                self.logger.info(f"  🚀 Aggressive hedge: ask={other_outcome.ask_price} → price={aggressive_price} (+{self.config.hedge_price_slippage:.0%} slippage)")
-                
-                order = await self._place_single_order(
-                    market=market,
-                    outcome=other_outcome,
-                    side=Side.BUY,
-                    price=aggressive_price,
-                    size_wei=size_wei
-                )
-                
-                if order:
-                    placed_orders.append(order)
-                    self.logger.info(f"  ✅ Hedge order placed: {other_outcome.name} @ ${market_price:.4f}")
-                
-                # Добавляем в tracking с флагом unhedged
-                if market.market_id not in self.markets:
-                    self.markets[market.market_id] = MarketState(
+            # 🛡️ В PASSIVE_POINTS режиме НЕ хеджируем - просто пропускаем этот рынок
+            if self.config.strategy_mode.upper() != "PASSIVE_POINTS":
+                existing_position = await self._check_existing_position(market)
+                if existing_position:
+                    position_info, other_outcome = existing_position
+                    self.logger.info(f"  ⚠️  Found existing position: {position_info['name']} ${position_info['value_usd']:.2f}")
+                    self.logger.info(f"  🛡️ Placing hedge order instead of delta-neutral pair")
+                    
+                    # Размещаем только hedge ордер с АГРЕССИВНОЙ ценой (ask + slippage)
+                    aggressive_price = self._get_aggressive_hedge_price(other_outcome.ask_price)
+                    size_usd = position_info['value_usd']
+                    size_wei = int(Decimal(str(size_usd / float(aggressive_price))) * WEI_MULTIPLIER)
+                    
+                    self.logger.info(f"  🚀 Aggressive hedge: ask={other_outcome.ask_price} → price={aggressive_price} (+{self.config.hedge_price_slippage:.0%} slippage)")
+                    
+                    order = await self._place_single_order(
                         market=market,
-                        entered_at=datetime.now(),
-                        last_rebalance=datetime.now(),
-                        has_unhedged_position=True
+                        outcome=other_outcome,
+                        side=Side.BUY,
+                        price=aggressive_price,
+                        size_wei=size_wei
                     )
-                else:
-                    self.markets[market.market_id].has_unhedged_position = True
-                    self.markets[market.market_id].last_rebalance = datetime.now()
-                
-                return placed_orders
+                    
+                    if order:
+                        placed_orders.append(order)
+                        self.logger.info(f"  ✅ Hedge order placed: {other_outcome.name} @ ${float(aggressive_price):.4f}")
+                    
+                    # Добавляем в tracking с флагом unhedged
+                    if market.market_id not in self.markets:
+                        self.markets[market.market_id] = MarketState(
+                            market=market,
+                            entered_at=datetime.now(),
+                            last_rebalance=datetime.now(),
+                            has_unhedged_position=True
+                        )
+                    else:
+                        self.markets[market.market_id].has_unhedged_position = True
+                        self.markets[market.market_id].last_rebalance = datetime.now()
+                    
+                    return placed_orders
             
             # Проверяем лимит позиции
             current_position = state.position_usd if state else 0.0
@@ -1779,7 +1781,13 @@ class MarketMakerBot:
         Returns:
             True если был размещён hedge ордер (не нужны дополнительные лимитки)
             False если позиция уже delta-neutral или нет позиции
+            
+        ВАЖНО: В режиме PASSIVE_POINTS всегда возвращает False (не хеджируем!)
         """
+        # 🛡️ В PASSIVE_POINTS режиме НЕ хеджируем
+        if self.config.strategy_mode.upper() == "PASSIVE_POINTS":
+            return False  # Не создаём убыточные hedge ордера
+        
         try:
             # Получаем текущие позиции
             positions = await self.graphql_client.get_positions()
@@ -2303,8 +2311,39 @@ class MarketMakerBot:
         4. Попробовать закрыть delta-neutral:
            - По рынку если убыток < порога
            - Лимиткой если убыток > порога
+           
+        ВАЖНО: В режиме PASSIVE_POINTS НЕ хеджируем, только логируем!
         """
         self.logger.info("🔍 Recovering existing positions...")
+        
+        # =================================================================
+        # 🛡️ В PASSIVE_POINTS режиме НЕ хеджируем старые позиции!
+        # Это создаёт убытки. Просто показываем что они есть.
+        # =================================================================
+        if self.config.strategy_mode.upper() == "PASSIVE_POINTS":
+            try:
+                positions = await self.graphql_client.get_positions()
+                if positions:
+                    total_value = sum(float(p.get('valueUsd', 0) or 0) for p in positions)
+                    self.logger.info(f"  📊 Found {len(positions)} existing position(s), total value: ${total_value:.2f}")
+                    self.logger.warning(f"  🛡️ PASSIVE_POINTS mode: NOT hedging old positions!")
+                    self.logger.warning(f"  💡 These positions are from previous strategy runs.")
+                    self.logger.warning(f"  💡 To close them: manually sell on predict.fun or wait for expiry.")
+                    
+                    # Просто логируем позиции для информации
+                    for pos in positions[:5]:  # Первые 5
+                        market_title = pos.get('market', {}).get('title', 'Unknown')[:30]
+                        outcome_name = pos.get('outcome', {}).get('name', '?')
+                        value = float(pos.get('valueUsd', 0) or 0)
+                        self.logger.info(f"    📌 {market_title}... | {outcome_name} | ${value:.2f}")
+                    
+                    if len(positions) > 5:
+                        self.logger.info(f"    ... and {len(positions) - 5} more")
+                else:
+                    self.logger.info("  ✅ No existing positions - clean start!")
+            except Exception as e:
+                self.logger.warning(f"  ⚠️ Could not check positions: {e}")
+            return  # НЕ пытаемся хеджировать в PASSIVE_POINTS режиме!
         
         # Собираем token_ids из существующих открытых ордеров
         # чтобы не дублировать hedge ордера
@@ -2649,7 +2688,13 @@ class MarketMakerBot:
         3. Она не delta-neutral (только одна сторона)
         
         Вызывается каждый цикл главного loop.
+        
+        ВАЖНО: В режиме PASSIVE_POINTS НЕ хеджируем!
         """
+        # 🛡️ В PASSIVE_POINTS режиме НЕ хеджируем orphaned позиции
+        if self.config.strategy_mode.upper() == "PASSIVE_POINTS":
+            return  # Просто игнорируем - не создаём убыточные hedge ордера
+        
         try:
             positions = await self.graphql_client.get_positions()
             if not positions:
@@ -2821,10 +2866,16 @@ class MarketMakerBot:
         if strategy == "PASSIVE_POINTS":
             self.logger.info(f"  🛡️ Strategy: PASSIVE_POINTS (SAFE - no fills, only points!)")
             self.logger.info(f"  🛡️ Passive spread: {self.config.passive_spread:.0%} (orders won't execute)")
+            self.logger.info(f"  🛡️ NO hedging of existing positions (avoiding losses)")
             if self.config.cancel_when_price_close:
                 self.logger.info(f"  🛡️ Price protection: ON (cancel if price within {self.config.price_proximity_threshold:.0%})")
             else:
                 self.logger.info(f"  ⚠️ Price protection: OFF (risky!)")
+            # Рекомендации для PASSIVE_POINTS
+            if self.config.max_probability - self.config.min_probability < 0.30:
+                self.logger.warning(f"  💡 TIP: Expand probability filter (e.g., 20%-80%) to find more markets")
+            if self.config.max_liquidity_usd < 50000:
+                self.logger.warning(f"  💡 TIP: Expand liquidity filter (e.g., $1000-$100000) to find more markets")
         elif strategy == "MERGE_ON_FILL":
             self.logger.info(f"  Strategy: MERGE_ON_FILL (merge positions to USDT)")
         else:
