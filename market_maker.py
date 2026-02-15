@@ -251,11 +251,12 @@ class BotConfig:
     passive_spread: float = 0.25             # PASSIVE: 25% - ордера почти никогда не исполнятся
     balanced_spread: float = 0.10            # BALANCED: 10% - редкие исполнения, хорошие поинты
     
-    # 🛡️ ЗАЩИТА ОТ ИСПОЛНЕНИЯ (для PASSIVE_POINTS)
+    # 🛡️ ЗАЩИТА ОТ ИСПОЛНЕНИЯ (для PASSIVE_POINTS и BALANCED)
     # Отменяем ордера если цена приблизилась слишком близко
     cancel_when_price_close: bool = True     # Включить защитную отмену
     price_proximity_threshold: float = 0.10  # Отменить если цена в пределах 10% от ордера
                                               # Пример: ордер @ 0.30, цена 0.33 → отменить!
+    price_check_interval_sec: int = 60       # Проверять цены каждые 60 секунд (быстро!)
     
     # Timing / Тайминги
     rebalance_interval_sec: int = 1200   # Интервал ребалансировки (20 минут - больше времени для fill!)
@@ -2903,6 +2904,7 @@ class MarketMakerBot:
         if strategy in ["PASSIVE_POINTS", "BALANCED"]:
             if self.config.cancel_when_price_close:
                 self.logger.info(f"  🛡️ Price protection: ON (cancel if within {self.config.price_proximity_threshold:.0%})")
+                self.logger.info(f"  ⚡ Price check interval: {self.config.price_check_interval_sec}s (fast monitoring!)")
             # Рекомендации по фильтрам
             if self.config.max_probability - self.config.min_probability < 0.30:
                 self.logger.warning(f"  💡 TIP: Expand probability filter (e.g., 20%-80%) to find more markets")
@@ -2956,45 +2958,63 @@ class MarketMakerBot:
                 else:
                     self.logger.info("⏭️  Position recovery disabled")
                 
-                # Главный цикл бота
+                # Главный цикл бота с быстрой проверкой цен
+                last_full_rebalance = datetime.now()
+                last_price_check = datetime.now()
+                
                 while True:
                     try:
-                        # Получаем рынки
-                        markets = await self.get_suitable_markets()
+                        now = datetime.now()
                         
-                        if not markets:
-                            self.logger.warning("⚠️  No suitable markets found. Waiting...")
-                            await asyncio.sleep(self.config.rebalance_interval_sec)
-                            continue
+                        # ===================================================
+                        # 🛡️ БЫСТРАЯ ПРОВЕРКА ЦЕН (каждые price_check_interval_sec)
+                        # ===================================================
+                        price_check_elapsed = (now - last_price_check).total_seconds()
+                        if price_check_elapsed >= self.config.price_check_interval_sec:
+                            # Проверяем не приблизилась ли цена к нашим ордерам
+                            cancelled = await self._cancel_orders_if_price_close()
+                            if cancelled > 0:
+                                self.logger.info(f"⚡ Quick price check: cancelled {cancelled} order(s)")
+                            last_price_check = now
                         
-                        # Размещаем ордера на новых рынках
-                        for market in markets[:5]:
-                            # Пропускаем если уже есть ордера (из recovery или текущей сессии)
-                            if market.market_id in self.markets:
-                                continue
-                            if market.market_id in markets_with_orders:
-                                self.logger.debug(f"  ⏭️  Skipping {market.title[:30]}... (has existing orders)")
-                                continue
+                        # ===================================================
+                        # 📊 ПОЛНАЯ РЕБАЛАНСИРОВКА (каждые rebalance_interval_sec)
+                        # ===================================================
+                        rebalance_elapsed = (now - last_full_rebalance).total_seconds()
+                        if rebalance_elapsed >= self.config.rebalance_interval_sec:
+                            self.logger.info(f"🔄 Full rebalance cycle (every {self.config.rebalance_interval_sec}s)")
                             
-                            await self.place_limit_orders(market)
-                            await asyncio.sleep(self.config.api_delay_sec)
+                            # Получаем рынки
+                            markets = await self.get_suitable_markets()
+                            
+                            if markets:
+                                # Размещаем ордера на новых рынках
+                                for market in markets[:5]:
+                                    # Пропускаем если уже есть ордера
+                                    if market.market_id in self.markets:
+                                        continue
+                                    if market.market_id in markets_with_orders:
+                                        continue
+                                    
+                                    await self.place_limit_orders(market)
+                                    await asyncio.sleep(self.config.api_delay_sec)
+                            else:
+                                self.logger.warning("⚠️  No suitable markets found")
+                            
+                            # Синхронизируем ордера с биржей
+                            await self._sync_orders_with_exchange()
+                            
+                            # Ребалансировка существующих позиций
+                            await self._rebalance_existing_markets()
+                            
+                            # Проверяем осиротевшие позиции
+                            await self._check_orphaned_positions()
+                            
+                            self.log_statistics()
+                            last_full_rebalance = now
                         
-                        # ВАЖНО: Синхронизируем локальные ордера с биржей
-                        # Это отслеживает экспирацию ордеров и переставляет hedge
-                        await self._sync_orders_with_exchange()
-                        
-                        # 🛡️ ЗАЩИТА: Отменяем ордера если цена приблизилась
-                        # Предотвращает исполнение в убыточной ситуации
-                        await self._cancel_orders_if_price_close()
-                        
-                        # Ребалансировка существующих позиций
-                        await self._rebalance_existing_markets()
-                        
-                        # ВАЖНО: Проверяем осиротевшие позиции (не отслеживаемые в self.markets)
-                        await self._check_orphaned_positions()
-                        
-                        self.log_statistics()
-                        await asyncio.sleep(self.config.rebalance_interval_sec)
+                        # Спим короткий интервал для быстрой реакции на цены
+                        await asyncio.sleep(min(self.config.price_check_interval_sec, 30))
                         
                     except asyncio.CancelledError:
                         break
@@ -3094,6 +3114,8 @@ def load_config() -> BotConfig:
         config.cancel_when_price_close = os.getenv("CANCEL_WHEN_PRICE_CLOSE", "").lower() in ("true", "1", "yes")
     if os.getenv("PRICE_PROXIMITY_THRESHOLD"):
         config.price_proximity_threshold = float(os.getenv("PRICE_PROXIMITY_THRESHOLD"))
+    if os.getenv("PRICE_CHECK_INTERVAL_SEC"):
+        config.price_check_interval_sec = int(os.getenv("PRICE_CHECK_INTERVAL_SEC"))
     
     return config
 
