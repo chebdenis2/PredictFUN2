@@ -2959,8 +2959,11 @@ class MarketMakerBot:
                     self.logger.info("⏭️  Position recovery disabled")
                 
                 # Главный цикл бота с быстрой проверкой цен
-                last_full_rebalance = datetime.now()
+                # ВАЖНО: Устанавливаем время в прошлое чтобы первая ребалансировка была СРАЗУ
+                last_full_rebalance = datetime.now() - timedelta(seconds=self.config.rebalance_interval_sec + 1)
                 last_price_check = datetime.now()
+                
+                self.logger.info("🚀 Starting main loop...")
                 
                 while True:
                     try:
@@ -3014,7 +3017,11 @@ class MarketMakerBot:
                             last_full_rebalance = now
                         
                         # Спим короткий интервал для быстрой реакции на цены
-                        await asyncio.sleep(min(self.config.price_check_interval_sec, 30))
+                        sleep_time = min(self.config.price_check_interval_sec, 30)
+                        next_rebalance_in = self.config.rebalance_interval_sec - rebalance_elapsed
+                        if next_rebalance_in > 60:
+                            self.logger.debug(f"💤 Sleeping {sleep_time}s (next rebalance in {next_rebalance_in:.0f}s)")
+                        await asyncio.sleep(sleep_time)
                         
                     except asyncio.CancelledError:
                         break
