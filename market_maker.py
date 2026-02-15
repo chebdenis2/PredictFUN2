@@ -240,6 +240,16 @@ class BotConfig:
     hedge_price_slippage: float = 0.05       # Slippage для hedge ордеров (5% выше ask для быстрого исполнения)
                                               # ask_price * (1 + slippage) = aggressive price
     
+    # Strategy mode / Режим стратегии
+    # "DELTA_NEUTRAL" - покупаем обе стороны (текущий, рискованный)
+    # "PASSIVE_POINTS" - ставим лимитки далеко от рынка, НЕ получаем fills, только points
+    # "MERGE_ON_FILL" - после исполнения обеих сторон делаем merge в USDT
+    strategy_mode: str = "PASSIVE_POINTS"    # БЕЗОПАСНЫЙ РЕЖИМ ПО УМОЛЧАНИЮ!
+    
+    # Passive mode settings / Настройки пассивного режима
+    passive_spread: float = 0.20             # Spread 20% от mid - ордера НЕ исполнятся
+                                              # Это даёт points без риска убытков!
+    
     # Timing / Тайминги
     rebalance_interval_sec: int = 1200   # Интервал ребалансировки (20 минут - больше времени для fill!)
     price_change_threshold: float = 0.02 # Порог изменения цены для ребалансировки (2%)
@@ -1416,30 +1426,69 @@ class MarketMakerBot:
             # Рассчитываем mid price из chancePercentage
             mid_price = Decimal(str(market.chance_percentage / 100.0))
             
-            # Пересчитываем размеры с учётом лимита
-            # Выбираем spread в зависимости от режима
-            if self.config.aggressive_pricing:
-                spread = Decimal("0.005")  # 0.5% - очень близко к рынку для быстрых fills
-                self.logger.info(f"  ⚡ AGGRESSIVE mode: 0.5% spread")
-            else:
-                spread = Decimal(str(self.config.target_spread))
+            # =================================================================
+            # ВЫБОР СТРАТЕГИИ
+            # =================================================================
+            strategy = self.config.strategy_mode.upper()
             
-            # Округляем цены до 2 знаков (требование API!)
-            bid_price = self._round_price(mid_price - spread, round_up=False)
-            ask_price = self._round_price(mid_price + spread, round_up=True)
+            if strategy == "PASSIVE_POINTS":
+                # =====================================================
+                # 🛡️ PASSIVE_POINTS: Безопасный режим для фарма поинтов
+                # =====================================================
+                # Ставим ордера ДАЛЕКО от рынка - они НЕ исполнятся!
+                # Получаем points за предоставление ликвидности без риска.
+                spread = Decimal(str(self.config.passive_spread))  # 20% по умолчанию
+                
+                self.logger.info(f"  🛡️ PASSIVE_POINTS MODE: {float(spread):.0%} spread (orders won't fill!)")
+                self.logger.info(f"  💰 You earn points for liquidity WITHOUT execution risk")
+                
+                # Bid ниже рынка, ask выше рынка (обе стороны BUY далеко от mid)
+                bid_price = self._round_price(mid_price - spread, round_up=False)
+                outcome_1_price = self._round_price(Decimal("1") - mid_price - spread, round_up=False)
+                
+                # Проверяем что цены в допустимом диапазоне
+                if bid_price < Decimal("0.01"):
+                    bid_price = Decimal("0.01")
+                if outcome_1_price < Decimal("0.01"):
+                    outcome_1_price = Decimal("0.01")
+                    
+            elif strategy == "AGGRESSIVE" or self.config.aggressive_pricing:
+                # ⚡ Агрессивный режим - ордера БЫСТРО исполнятся
+                spread = Decimal("0.005")  # 0.5% - очень близко к рынку
+                self.logger.info(f"  ⚡ AGGRESSIVE mode: 0.5% spread (RISKY!)")
+                
+                bid_price = self._round_price(mid_price - spread, round_up=False)
+                ask_price = self._round_price(mid_price + spread, round_up=True)
+                outcome_1_price = self._round_price(Decimal("1") - ask_price, round_up=False)
+                
+            else:
+                # 📊 DELTA_NEUTRAL (по умолчанию) - стандартный режим
+                spread = Decimal(str(self.config.target_spread))
+                
+                bid_price = self._round_price(mid_price - spread, round_up=False)
+                ask_price = self._round_price(mid_price + spread, round_up=True)
+                outcome_1_price = self._round_price(Decimal("1") - ask_price, round_up=False)
             
             bid_size_wei = int((Decimal(str(order_size)) / bid_price) * WEI_MULTIPLIER)
-            ask_size_wei = int((Decimal(str(order_size)) / ask_price) * WEI_MULTIPLIER)
+            ask_size_wei = int((Decimal(str(order_size)) / outcome_1_price) * WEI_MULTIPLIER)
             
-            # Delta-neutral цена для второго исхода (округляем вниз т.к. это BUY)
-            outcome_1_price = self._round_price(Decimal("1") - ask_price, round_up=False)
+            # =================================================================
+            # ЛОГИРОВАНИЕ СТРАТЕГИИ
+            # =================================================================
+            self.logger.info(f"  📊 Strategy: {strategy}")
+            self.logger.info(f"     Mid price: {mid_price:.4f} (probability {market.chance_percentage:.0f}%)")
+            self.logger.info(f"     Spread: {float(spread):.1%}")
+            self.logger.info(f"     {outcome_0.name}: BUY @ {bid_price:.4f}")
+            self.logger.info(f"     {outcome_1.name}: BUY @ {outcome_1_price:.4f}")
+            self.logger.info(f"     Order size: ${order_size:.2f} each side")
             
-            self.logger.info(f"  📊 DELTA-NEUTRAL STRATEGY:")
-            self.logger.info(f"     Mid price: {mid_price:.4f} (from probability {market.chance_percentage:.0f}%)")
-            self.logger.info(f"     Spread: {float(spread):.2%}")
-            self.logger.info(f"     {outcome_0.name}: BUY @ {bid_price:.4f} (mid - spread)")
-            self.logger.info(f"     {outcome_1.name}: BUY @ {outcome_1_price:.4f} (1 - ask = 1 - {ask_price:.4f})")
-            self.logger.info(f"     Order size: ${self.config.order_size_usd:.2f} each side")
+            # Предупреждение для рискованных режимов
+            if strategy not in ["PASSIVE_POINTS"]:
+                total_cost = float(bid_price) + float(outcome_1_price)
+                if total_cost > 1.0:
+                    self.logger.warning(f"  ⚠️  WARNING: Total cost {total_cost:.4f} > $1.00 = GUARANTEED LOSS!")
+                elif total_cost > 0.98:
+                    self.logger.warning(f"  ⚠️  WARNING: Total cost {total_cost:.4f} - risk of loss after fees!")
             
             # Размещаем ордер на первый исход (outcome_0)
             if outcome_0.on_chain_id:
@@ -2687,7 +2736,17 @@ class MarketMakerBot:
     def _log_config(self) -> None:
         """Логирование конфигурации при старте"""
         self.logger.info("📋 CONFIGURATION:")
-        self.logger.info(f"  Strategy: DELTA-NEUTRAL (BUY both sides)")
+        
+        # Strategy mode explanation
+        strategy = self.config.strategy_mode.upper()
+        if strategy == "PASSIVE_POINTS":
+            self.logger.info(f"  🛡️ Strategy: PASSIVE_POINTS (SAFE - no fills, only points!)")
+            self.logger.info(f"  🛡️ Passive spread: {self.config.passive_spread:.0%} (orders won't execute)")
+        elif strategy == "MERGE_ON_FILL":
+            self.logger.info(f"  Strategy: MERGE_ON_FILL (merge positions to USDT)")
+        else:
+            self.logger.info(f"  ⚠️ Strategy: {strategy} (RISKY - may lose money!)")
+        
         self.logger.info(f"  Order size: ${self.config.order_size_usd:.2f}")
         self.logger.info(f"  Target spread: {self.config.target_spread:.1%}")
         self.logger.info(f"  Aggressive pricing: {'ON (0.5% spread)' if self.config.aggressive_pricing else 'OFF'}")
@@ -2857,6 +2916,12 @@ def load_config() -> BotConfig:
         config.stop_new_orders_after_fill = os.getenv("STOP_NEW_ORDERS_AFTER_FILL", "").lower() in ("true", "1", "yes")
     if os.getenv("HEDGE_PRICE_SLIPPAGE"):
         config.hedge_price_slippage = float(os.getenv("HEDGE_PRICE_SLIPPAGE"))
+    
+    # New strategy settings
+    if os.getenv("STRATEGY_MODE"):
+        config.strategy_mode = os.getenv("STRATEGY_MODE", "PASSIVE_POINTS").upper()
+    if os.getenv("PASSIVE_SPREAD"):
+        config.passive_spread = float(os.getenv("PASSIVE_SPREAD"))
     
     return config
 
