@@ -249,7 +249,7 @@ class BotConfig:
     
     # Spread settings for each mode / Настройки spread для режимов
     passive_spread: float = 0.25             # PASSIVE: 25% - ордера почти никогда не исполнятся
-    balanced_spread: float = 0.10            # BALANCED: 10% - редкие исполнения, хорошие поинты
+    balanced_spread: float = 0.15            # BALANCED: 15% - увеличено для защиты от пустых стаканов
     
     # 📊 ORDERBOOK LEVELS MODE - позиционирование по уровням стакана
     # Вместо % отступа от mid-price, ставим ордер на N уровней позади лучшей цены
@@ -3154,6 +3154,20 @@ class MarketMakerBot:
             if self.config.cancel_when_price_close:
                 self.logger.info(f"  🛡️ Price protection: ON (cancel if within {self.config.price_proximity_threshold:.0%})")
                 self.logger.info(f"  ⚡ Price check interval: {self.config.price_check_interval_sec}s (fast monitoring!)")
+                
+                # Проверяем что spread > threshold + safety margin
+                effective_spread = self.config.balanced_spread if strategy == "BALANCED" else self.config.passive_spread
+                safety_buffer = effective_spread - self.config.price_proximity_threshold
+                
+                if safety_buffer < 0.05:  # Меньше 5% буфера
+                    self.logger.warning(f"  ⚠️ WARNING: Low safety buffer!")
+                    self.logger.warning(f"     Spread: {effective_spread:.0%} - Threshold: {self.config.price_proximity_threshold:.0%} = {safety_buffer:.0%} buffer")
+                    self.logger.warning(f"     💡 RECOMMENDED: Increase spread to {self.config.price_proximity_threshold + 0.10:.0%} or decrease threshold")
+                else:
+                    self.logger.info(f"  ✅ Safety buffer: {safety_buffer:.0%} (spread - threshold)")
+            else:
+                self.logger.warning(f"  ⚠️ Price protection is OFF! Orders may fill unexpectedly!")
+                
             # Рекомендации по фильтрам
             if self.config.max_probability - self.config.min_probability < 0.30:
                 self.logger.warning(f"  💡 TIP: Expand probability filter (e.g., 20%-80%) to find more markets")
