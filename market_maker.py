@@ -241,14 +241,15 @@ class BotConfig:
                                               # ask_price * (1 + slippage) = aggressive price
     
     # Strategy mode / Режим стратегии
-    # "DELTA_NEUTRAL" - покупаем обе стороны (текущий, рискованный)
-    # "PASSIVE_POINTS" - ставим лимитки далеко от рынка, НЕ получаем fills, только points
-    # "MERGE_ON_FILL" - после исполнения обеих сторон делаем merge в USDT
-    strategy_mode: str = "PASSIVE_POINTS"    # БЕЗОПАСНЫЙ РЕЖИМ ПО УМОЛЧАНИЮ!
+    # "PASSIVE_POINTS" - spread 25%, минимум риска, меньше поинтов
+    # "BALANCED"       - spread 10%, умеренный риск, больше поинтов (РЕКОМЕНДУЕТСЯ!)
+    # "DELTA_NEUTRAL"  - spread 2%, высокий риск, максимум поинтов
+    # "AGGRESSIVE"     - spread 0.5%, очень высокий риск
+    strategy_mode: str = "BALANCED"          # РЕКОМЕНДУЕМЫЙ РЕЖИМ!
     
-    # Passive mode settings / Настройки пассивного режима
-    passive_spread: float = 0.25             # Spread 25% от mid - ордера НЕ исполнятся
-                                              # Это даёт points без риска убытков!
+    # Spread settings for each mode / Настройки spread для режимов
+    passive_spread: float = 0.25             # PASSIVE: 25% - ордера почти никогда не исполнятся
+    balanced_spread: float = 0.10            # BALANCED: 10% - редкие исполнения, хорошие поинты
     
     # 🛡️ ЗАЩИТА ОТ ИСПОЛНЕНИЯ (для PASSIVE_POINTS)
     # Отменяем ордера если цена приблизилась слишком близко
@@ -1358,8 +1359,8 @@ class MarketMakerBot:
             # ВАЖНО: Перед размещением ордеров проверяем существующие позиции на бирже
             # Это нужно для случаев когда рынок был удалён из tracking (ротация),
             # но позиция на бирже осталась
-            # 🛡️ В PASSIVE_POINTS режиме НЕ хеджируем - просто пропускаем этот рынок
-            if self.config.strategy_mode.upper() != "PASSIVE_POINTS":
+            # 🛡️ В PASSIVE_POINTS и BALANCED режимах НЕ хеджируем - просто пропускаем
+            if self.config.strategy_mode.upper() not in ["PASSIVE_POINTS", "BALANCED"]:
                 existing_position = await self._check_existing_position(market)
                 if existing_position:
                     position_info, other_outcome = existing_position
@@ -1460,17 +1461,37 @@ class MarketMakerBot:
                 if outcome_1_price < Decimal("0.01"):
                     outcome_1_price = Decimal("0.01")
                     
+            elif strategy == "BALANCED":
+                # =====================================================
+                # ⚖️ BALANCED: Оптимальный баланс риск/поинты (РЕКОМЕНДУЕТСЯ!)
+                # =====================================================
+                # Spread 10% - достаточно близко для поинтов, но исполнения редки
+                # Если исполнится - потеря ~10%, но это редко происходит
+                spread = Decimal(str(self.config.balanced_spread))  # 10% по умолчанию
+                
+                self.logger.info(f"  ⚖️ BALANCED MODE: {float(spread):.0%} spread")
+                self.logger.info(f"  💰 Good points, rare fills, moderate risk")
+                
+                bid_price = self._round_price(mid_price - spread, round_up=False)
+                outcome_1_price = self._round_price(Decimal("1") - mid_price - spread, round_up=False)
+                
+                # Проверяем границы
+                if bid_price < Decimal("0.01"):
+                    bid_price = Decimal("0.01")
+                if outcome_1_price < Decimal("0.01"):
+                    outcome_1_price = Decimal("0.01")
+                    
             elif strategy == "AGGRESSIVE" or self.config.aggressive_pricing:
                 # ⚡ Агрессивный режим - ордера БЫСТРО исполнятся
                 spread = Decimal("0.005")  # 0.5% - очень близко к рынку
-                self.logger.info(f"  ⚡ AGGRESSIVE mode: 0.5% spread (RISKY!)")
+                self.logger.info(f"  ⚡ AGGRESSIVE mode: 0.5% spread (VERY RISKY!)")
                 
                 bid_price = self._round_price(mid_price - spread, round_up=False)
                 ask_price = self._round_price(mid_price + spread, round_up=True)
                 outcome_1_price = self._round_price(Decimal("1") - ask_price, round_up=False)
                 
             else:
-                # 📊 DELTA_NEUTRAL (по умолчанию) - стандартный режим
+                # 📊 DELTA_NEUTRAL - рискованный режим (не рекомендуется)
                 spread = Decimal(str(self.config.target_spread))
                 
                 bid_price = self._round_price(mid_price - spread, round_up=False)
@@ -1491,7 +1512,7 @@ class MarketMakerBot:
             self.logger.info(f"     Order size: ${order_size:.2f} each side")
             
             # Предупреждение для рискованных режимов
-            if strategy not in ["PASSIVE_POINTS"]:
+            if strategy not in ["PASSIVE_POINTS", "BALANCED"]:
                 total_cost = float(bid_price) + float(outcome_1_price)
                 if total_cost > 1.0:
                     self.logger.warning(f"  ⚠️  WARNING: Total cost {total_cost:.4f} > $1.00 = GUARANTEED LOSS!")
@@ -1784,8 +1805,8 @@ class MarketMakerBot:
             
         ВАЖНО: В режиме PASSIVE_POINTS всегда возвращает False (не хеджируем!)
         """
-        # 🛡️ В PASSIVE_POINTS режиме НЕ хеджируем
-        if self.config.strategy_mode.upper() == "PASSIVE_POINTS":
+        # 🛡️ В PASSIVE_POINTS и BALANCED режимах НЕ хеджируем
+        if self.config.strategy_mode.upper() in ["PASSIVE_POINTS", "BALANCED"]:
             return False  # Не создаём убыточные hedge ордера
         
         try:
@@ -2246,8 +2267,8 @@ class MarketMakerBot:
         if not self.config.cancel_when_price_close:
             return 0
             
-        if self.config.strategy_mode.upper() != "PASSIVE_POINTS":
-            return 0  # Защита только для пассивного режима
+        if self.config.strategy_mode.upper() not in ["PASSIVE_POINTS", "BALANCED"]:
+            return 0  # Защита только для пассивного и balanced режимов
         
         cancelled_count = 0
         threshold = self.config.price_proximity_threshold
@@ -2317,10 +2338,10 @@ class MarketMakerBot:
         self.logger.info("🔍 Recovering existing positions...")
         
         # =================================================================
-        # 🛡️ В PASSIVE_POINTS режиме НЕ хеджируем старые позиции!
+        # 🛡️ В PASSIVE_POINTS и BALANCED режимах НЕ хеджируем старые позиции!
         # Это создаёт убытки. Просто показываем что они есть.
         # =================================================================
-        if self.config.strategy_mode.upper() == "PASSIVE_POINTS":
+        if self.config.strategy_mode.upper() in ["PASSIVE_POINTS", "BALANCED"]:
             try:
                 positions = await self.graphql_client.get_positions()
                 if positions:
@@ -2691,8 +2712,8 @@ class MarketMakerBot:
         
         ВАЖНО: В режиме PASSIVE_POINTS НЕ хеджируем!
         """
-        # 🛡️ В PASSIVE_POINTS режиме НЕ хеджируем orphaned позиции
-        if self.config.strategy_mode.upper() == "PASSIVE_POINTS":
+        # 🛡️ В PASSIVE_POINTS и BALANCED режимах НЕ хеджируем orphaned позиции
+        if self.config.strategy_mode.upper() in ["PASSIVE_POINTS", "BALANCED"]:
             return  # Просто игнорируем - не создаём убыточные hedge ордера
         
         try:
@@ -2864,22 +2885,27 @@ class MarketMakerBot:
         # Strategy mode explanation
         strategy = self.config.strategy_mode.upper()
         if strategy == "PASSIVE_POINTS":
-            self.logger.info(f"  🛡️ Strategy: PASSIVE_POINTS (SAFE - no fills, only points!)")
-            self.logger.info(f"  🛡️ Passive spread: {self.config.passive_spread:.0%} (orders won't execute)")
-            self.logger.info(f"  🛡️ NO hedging of existing positions (avoiding losses)")
-            if self.config.cancel_when_price_close:
-                self.logger.info(f"  🛡️ Price protection: ON (cancel if price within {self.config.price_proximity_threshold:.0%})")
-            else:
-                self.logger.info(f"  ⚠️ Price protection: OFF (risky!)")
-            # Рекомендации для PASSIVE_POINTS
-            if self.config.max_probability - self.config.min_probability < 0.30:
-                self.logger.warning(f"  💡 TIP: Expand probability filter (e.g., 20%-80%) to find more markets")
-            if self.config.max_liquidity_usd < 50000:
-                self.logger.warning(f"  💡 TIP: Expand liquidity filter (e.g., $1000-$100000) to find more markets")
+            self.logger.info(f"  🛡️ Strategy: PASSIVE_POINTS (SAFEST - minimal fills)")
+            self.logger.info(f"  🛡️ Spread: {self.config.passive_spread:.0%} (very far from market)")
+            self.logger.info(f"  🛡️ NO hedging of existing positions")
+            self.logger.info(f"  ⚠️ Points efficiency: LOW (orders too far from mid-price)")
+        elif strategy == "BALANCED":
+            self.logger.info(f"  ⚖️ Strategy: BALANCED (RECOMMENDED - good points, low risk)")
+            self.logger.info(f"  ⚖️ Spread: {self.config.balanced_spread:.0%} (moderate distance)")
+            self.logger.info(f"  ⚖️ NO hedging of existing positions")
+            self.logger.info(f"  💰 Points efficiency: GOOD (closer to mid-price)")
         elif strategy == "MERGE_ON_FILL":
             self.logger.info(f"  Strategy: MERGE_ON_FILL (merge positions to USDT)")
         else:
             self.logger.info(f"  ⚠️ Strategy: {strategy} (RISKY - may lose money!)")
+        
+        # Защита от исполнения для безопасных режимов
+        if strategy in ["PASSIVE_POINTS", "BALANCED"]:
+            if self.config.cancel_when_price_close:
+                self.logger.info(f"  🛡️ Price protection: ON (cancel if within {self.config.price_proximity_threshold:.0%})")
+            # Рекомендации по фильтрам
+            if self.config.max_probability - self.config.min_probability < 0.30:
+                self.logger.warning(f"  💡 TIP: Expand probability filter (e.g., 20%-80%) to find more markets")
         
         self.logger.info(f"  Order size: ${self.config.order_size_usd:.2f}")
         self.logger.info(f"  Target spread: {self.config.target_spread:.1%}")
@@ -3057,9 +3083,11 @@ def load_config() -> BotConfig:
     
     # New strategy settings
     if os.getenv("STRATEGY_MODE"):
-        config.strategy_mode = os.getenv("STRATEGY_MODE", "PASSIVE_POINTS").upper()
+        config.strategy_mode = os.getenv("STRATEGY_MODE", "BALANCED").upper()
     if os.getenv("PASSIVE_SPREAD"):
         config.passive_spread = float(os.getenv("PASSIVE_SPREAD"))
+    if os.getenv("BALANCED_SPREAD"):
+        config.balanced_spread = float(os.getenv("BALANCED_SPREAD"))
     
     # Price protection settings
     if os.getenv("CANCEL_WHEN_PRICE_CLOSE"):
