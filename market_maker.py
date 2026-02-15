@@ -253,7 +253,8 @@ class BotConfig:
     
     # 📊 ORDERBOOK LEVELS MODE - позиционирование по уровням стакана
     # Вместо % отступа от mid-price, ставим ордер на N уровней позади лучшей цены
-    use_orderbook_levels: bool = True        # Использовать уровни стакана вместо % spread
+    # ⚠️ ВРЕМЕННО ОТКЛЮЧЕНО: API /v1/orderbook/{id} возвращает 404
+    use_orderbook_levels: bool = False       # Использовать уровни стакана вместо % spread
     levels_behind: int = 3                   # На сколько уровней ниже лучшего bid ставить ордер
     min_level_spread: float = 0.01           # Мин. отступ от лучшей цены если стакан пустой (1%)
     
@@ -593,7 +594,7 @@ class PredictGraphQLClient:
         except aiohttp.ClientError as e:
             raise Exception(f"REST request failed: {e}")
     
-    async def _rest_request_auth(self, method: str, path: str, payload: dict = None, _retry: bool = True) -> dict:
+    async def _rest_request_auth(self, method: str, path: str, payload: dict = None, _retry: bool = True, log_response: bool = True) -> dict:
         """Make authenticated REST API request with auto-refresh JWT"""
         if not self.session:
             timeout = aiohttp.ClientTimeout(total=self.timeout_sec)
@@ -609,7 +610,8 @@ class PredictGraphQLClient:
             if method == "GET":
                 async with self.session.get(url, headers=headers) as response:
                     text = await response.text()
-                    self.logger.info(f"    REST response ({response.status}): {text[:300]}")
+                    if log_response:
+                        self.logger.info(f"    REST response ({response.status}): {text[:300]}")
                     
                     # При 401 пытаемся переавторизоваться
                     if response.status == 401 and _retry:
@@ -623,7 +625,8 @@ class PredictGraphQLClient:
             else:
                 async with self.session.post(url, json=payload, headers=headers) as response:
                     text = await response.text()
-                    self.logger.info(f"    REST response ({response.status}): {text[:300]}")
+                    if log_response:
+                        self.logger.info(f"    REST response ({response.status}): {text[:300]}")
                     
                     # При 401 пытаемся переавторизоваться
                     if response.status == 401 and _retry:
@@ -869,9 +872,12 @@ class PredictGraphQLClient:
                 "asks": [{"price": 0.52, "size": 100}, ...]   # Продавцы (от низкой к высокой)
             }
             или None при ошибке
+            
+        Note: API endpoint /v1/orderbook/{id} может быть недоступен (404)
         """
         try:
-            response = await self._rest_request_auth("GET", f"/v1/orderbook/{market_id}")
+            # Пробуем разные endpoints
+            response = await self._rest_request_auth("GET", f"/v1/orderbook/{market_id}", log_response=False)
             if not response.get("success"):
                 return None
             
@@ -2457,7 +2463,7 @@ class MarketMakerBot:
                     self.logger.info(f"🔄 SYNC: {state.market.title[:40]}...")
                     self.logger.info(f"  ⚠️ {removed_count} order(s) expired/removed on exchange")
                     markets_needing_hedge_check.add(market_id)
-                    self.stats['cancelled'] += removed_count  # Считаем как отменённые
+                    self.orders_cancelled += removed_count  # Считаем как отменённые
             
             if expired_order_ids:
                 self.logger.info(f"🔄 Order sync: {len(expired_order_ids)} expired order(s) removed from tracking")
@@ -2548,7 +2554,7 @@ class MarketMakerBot:
                         cancelled_count += len(orders_to_cancel)
                         # Удаляем из локального состояния
                         state.our_orders = [o for o in state.our_orders if o.order_id not in orders_to_cancel]
-                        self.stats['cancelled'] += len(orders_to_cancel)
+                        self.orders_cancelled += len(orders_to_cancel)
                         self.logger.info(f"   ✅ Cancelled {len(orders_to_cancel)} order(s) - PROTECTED!")
                 
                 await asyncio.sleep(self.config.api_delay_sec)
