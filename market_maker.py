@@ -247,8 +247,14 @@ class BotConfig:
     strategy_mode: str = "PASSIVE_POINTS"    # БЕЗОПАСНЫЙ РЕЖИМ ПО УМОЛЧАНИЮ!
     
     # Passive mode settings / Настройки пассивного режима
-    passive_spread: float = 0.20             # Spread 20% от mid - ордера НЕ исполнятся
+    passive_spread: float = 0.25             # Spread 25% от mid - ордера НЕ исполнятся
                                               # Это даёт points без риска убытков!
+    
+    # 🛡️ ЗАЩИТА ОТ ИСПОЛНЕНИЯ (для PASSIVE_POINTS)
+    # Отменяем ордера если цена приблизилась слишком близко
+    cancel_when_price_close: bool = True     # Включить защитную отмену
+    price_proximity_threshold: float = 0.10  # Отменить если цена в пределах 10% от ордера
+                                              # Пример: ордер @ 0.30, цена 0.33 → отменить!
     
     # Timing / Тайминги
     rebalance_interval_sec: int = 1200   # Интервал ребалансировки (20 минут - больше времени для fill!)
@@ -2214,6 +2220,79 @@ class MarketMakerBot:
             self.logger.warning(f"⚠️ Order sync error: {e}")
             return 0
     
+    async def _cancel_orders_if_price_close(self) -> int:
+        """
+        🛡️ ЗАЩИТА ОТ ИСПОЛНЕНИЯ В PASSIVE_POINTS РЕЖИМЕ
+        
+        Проблема: Даже с 20% spread, перед экспирацией рынок может резко 
+        измениться (например с 50/50 на 20/80) и наша лимитка исполнится
+        на убыточной стороне.
+        
+        Решение: Мониторить приближение цены к нашим ордерам.
+        Если цена приблизилась ближе чем price_proximity_threshold - 
+        ОТМЕНИТЬ ордер до исполнения!
+        
+        Returns:
+            Количество отменённых ордеров
+        """
+        if not self.config.cancel_when_price_close:
+            return 0
+            
+        if self.config.strategy_mode.upper() != "PASSIVE_POINTS":
+            return 0  # Защита только для пассивного режима
+        
+        cancelled_count = 0
+        threshold = self.config.price_proximity_threshold
+        
+        try:
+            for market_id, state in list(self.markets.items()):
+                if not state.our_orders:
+                    continue
+                
+                # Получаем актуальную цену рынка
+                updated_market = await self.graphql_client.get_market(market_id)
+                if not updated_market:
+                    continue
+                
+                current_mid = Decimal(str(updated_market.chance_percentage / 100.0))
+                
+                orders_to_cancel: list[str] = []
+                
+                for order in state.our_orders:
+                    order_price = float(order.price)
+                    
+                    # Проверяем приближение цены к ордеру
+                    # Для BUY ордера: опасно когда цена ПАДАЕТ к нашему bid
+                    price_diff = abs(float(current_mid) - order_price)
+                    
+                    if price_diff <= threshold:
+                        self.logger.warning(f"🚨 PRICE CLOSE TO ORDER!")
+                        self.logger.warning(f"   Market: {state.market.title[:40]}...")
+                        self.logger.warning(f"   Order @ ${order_price:.2f}, Current mid: ${float(current_mid):.2f}")
+                        self.logger.warning(f"   Distance: {price_diff:.2%} <= threshold {threshold:.2%}")
+                        self.logger.warning(f"   ⚡ CANCELLING to prevent fill!")
+                        orders_to_cancel.append(order.order_id)
+                
+                if orders_to_cancel:
+                    success = await self.graphql_client.cancel_orders_rest(orders_to_cancel)
+                    if success:
+                        cancelled_count += len(orders_to_cancel)
+                        # Удаляем из локального состояния
+                        state.our_orders = [o for o in state.our_orders if o.order_id not in orders_to_cancel]
+                        self.stats['cancelled'] += len(orders_to_cancel)
+                        self.logger.info(f"   ✅ Cancelled {len(orders_to_cancel)} order(s) - PROTECTED!")
+                
+                await asyncio.sleep(self.config.api_delay_sec)
+            
+            if cancelled_count > 0:
+                self.logger.info(f"🛡️ Price protection: cancelled {cancelled_count} order(s) approaching execution")
+            
+            return cancelled_count
+            
+        except Exception as e:
+            self.logger.warning(f"⚠️ Price protection error: {e}")
+            return 0
+    
     async def _recover_positions(self) -> None:
         """
         Восстановить позиции при перезапуске бота
@@ -2742,6 +2821,10 @@ class MarketMakerBot:
         if strategy == "PASSIVE_POINTS":
             self.logger.info(f"  🛡️ Strategy: PASSIVE_POINTS (SAFE - no fills, only points!)")
             self.logger.info(f"  🛡️ Passive spread: {self.config.passive_spread:.0%} (orders won't execute)")
+            if self.config.cancel_when_price_close:
+                self.logger.info(f"  🛡️ Price protection: ON (cancel if price within {self.config.price_proximity_threshold:.0%})")
+            else:
+                self.logger.info(f"  ⚠️ Price protection: OFF (risky!)")
         elif strategy == "MERGE_ON_FILL":
             self.logger.info(f"  Strategy: MERGE_ON_FILL (merge positions to USDT)")
         else:
@@ -2822,6 +2905,10 @@ class MarketMakerBot:
                         # ВАЖНО: Синхронизируем локальные ордера с биржей
                         # Это отслеживает экспирацию ордеров и переставляет hedge
                         await self._sync_orders_with_exchange()
+                        
+                        # 🛡️ ЗАЩИТА: Отменяем ордера если цена приблизилась
+                        # Предотвращает исполнение в убыточной ситуации
+                        await self._cancel_orders_if_price_close()
                         
                         # Ребалансировка существующих позиций
                         await self._rebalance_existing_markets()
@@ -2922,6 +3009,12 @@ def load_config() -> BotConfig:
         config.strategy_mode = os.getenv("STRATEGY_MODE", "PASSIVE_POINTS").upper()
     if os.getenv("PASSIVE_SPREAD"):
         config.passive_spread = float(os.getenv("PASSIVE_SPREAD"))
+    
+    # Price protection settings
+    if os.getenv("CANCEL_WHEN_PRICE_CLOSE"):
+        config.cancel_when_price_close = os.getenv("CANCEL_WHEN_PRICE_CLOSE", "").lower() in ("true", "1", "yes")
+    if os.getenv("PRICE_PROXIMITY_THRESHOLD"):
+        config.price_proximity_threshold = float(os.getenv("PRICE_PROXIMITY_THRESHOLD"))
     
     return config
 
