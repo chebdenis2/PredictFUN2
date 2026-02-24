@@ -33,8 +33,10 @@ What this script does:
 """
 
 import asyncio
+import atexit
 import logging
 import os
+import signal
 import sys
 import json
 from dataclasses import dataclass, field
@@ -1126,17 +1128,19 @@ class MarketMakerBot:
         
         self.logger.info("✅ MarketMakerBot initialized")
     
-    # Файл для сохранения ID ордеров между сессиями
-    _ORDERS_FILE = ".bot_active_orders.json"
+    def _get_orders_file_path(self) -> str:
+        """Абсолютный путь к файлу ордеров (рядом со скриптом)."""
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), ".bot_active_orders.json")
     
     def _save_order_ids(self) -> None:
         """Сохранить ID всех активных ордеров в файл для восстановления при рестарте."""
         try:
             ids = [oid for oid, o in self.active_orders.items() if o.status == OrderStatus.OPEN]
-            with open(self._ORDERS_FILE, "w") as f:
+            path = self._get_orders_file_path()
+            with open(path, "w") as f:
                 json.dump(ids, f)
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(f"⚠️ Failed to save orders file: {e}")
     
     async def _cancel_saved_orders(self) -> int:
         """
@@ -1149,11 +1153,12 @@ class MarketMakerBot:
         Файл .bot_active_orders.json содержит ID ордеров, которые бот
         создал в прошлой сессии. Мы их отменяем безусловно.
         """
+        path = self._get_orders_file_path()
         try:
-            with open(self._ORDERS_FILE, "r") as f:
+            with open(path, "r") as f:
                 saved_ids = json.load(f)
         except (FileNotFoundError, json.JSONDecodeError):
-            self.logger.info("🧹 No saved orders file — clean start")
+            self.logger.info(f"🧹 No saved orders file — clean start ({path})")
             return 0
         
         if not saved_ids:
@@ -3381,6 +3386,17 @@ class MarketMakerBot:
                     self.logger.error("❌ Failed to login. Cannot place orders.")
                     return
                 
+                # Регистрируем сохранение файла при любом завершении процесса
+                def _save_on_exit():
+                    try:
+                        ids = [oid for oid, o in self.active_orders.items() if o.status == OrderStatus.OPEN]
+                        path = self._get_orders_file_path()
+                        with open(path, "w") as f:
+                            json.dump(ids, f)
+                    except Exception:
+                        pass
+                atexit.register(_save_on_exit)
+                
                 # Восстанавливаем состояние после перезапуска
                 markets_with_orders: set[str] = set()
                 if self.config.recover_positions_on_start:
@@ -3390,9 +3406,25 @@ class MarketMakerBot:
                     self.logger.info("⏭️  Position recovery disabled")
                 
                 # Отменяем ордера от предыдущей сессии через файл
-                # (API может возвращать пустой список до 45 сек после логина)
                 await self._cancel_saved_orders()
-                await self._cancel_ghost_orders()
+                
+                # Ждём прогрева API и отменяем ghost-ордера
+                # API get_open_orders() может возвращать пустой список 30-60 сек после логина
+                self.logger.info("⏳ Waiting for order API warm-up...")
+                for _attempt in range(8):
+                    await asyncio.sleep(5)
+                    ghost_count = await self._cancel_ghost_orders()
+                    if ghost_count > 0:
+                        self.logger.info(f"  ✅ Ghost cleanup done (attempt {_attempt + 1})")
+                        break
+                    test_orders = await self.graphql_client.get_open_orders("OPEN")
+                    if test_orders:
+                        self.logger.info(f"  ✅ API ready, {len(test_orders)} order(s) visible, all tracked")
+                        break
+                    if _attempt < 7:
+                        self.logger.info(f"  ⏳ API returned empty (attempt {_attempt + 1}/8), retrying...")
+                else:
+                    self.logger.warning("  ⚠️ API still returning empty after warm-up, proceeding anyway")
                 
                 # Главный цикл бота с быстрой проверкой цен
                 # ВАЖНО: Устанавливаем время в прошлое чтобы первая ребалансировка была СРАЗУ
@@ -3616,3 +3648,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 Interrupted")
+    except SystemExit:
+        pass
