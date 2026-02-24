@@ -2159,19 +2159,34 @@ class MarketMakerBot:
                     self.logger.warning(f"  ⚠️  Could not fetch market {market_id} - skipping")
                     continue
                 
-                # Smart rebalance: пропускаем если цена не изменилась значительно
-                if self.config.skip_rebalance_if_price_stable and state.last_mid_price is not None:
+                # Проверяем есть ли активные ордера на рынке
+                has_active_orders = bool(state.our_orders)
+                
+                if not has_active_orders:
+                    # Ордера истекли или были отменены — нужно выставить заново
+                    self.logger.info(f"🔄 Re-placing orders (expired/cancelled): {state.market.title[:40]}...")
+                elif self.config.skip_rebalance_if_price_stable and state.last_mid_price is not None:
                     current_mid = Decimal(str(updated.chance_percentage / 100.0))
                     price_change = abs(float(current_mid - state.last_mid_price))
                     
-                    if price_change < self.config.price_change_threshold:
-                        self.logger.info(f"⏭️  Skip rebalance: {state.market.title[:30]}... (price Δ {price_change:.2%} < {self.config.price_change_threshold:.2%})")
-                        # Обновляем время и данные рынка
+                    # В PASSIVE_POINTS/BALANCED используем бОльший порог ребалансировки:
+                    # половина спреда. С 20% спредом — ребаланс только при движении >10%.
+                    # Это предотвращает бессмысленную перестановку ордеров при мелких колебаниях.
+                    strategy = self.config.strategy_mode.upper()
+                    if strategy == "PASSIVE_POINTS":
+                        effective_threshold = self.config.passive_spread / 2
+                    elif strategy == "BALANCED":
+                        effective_threshold = self.config.balanced_spread / 2
+                    else:
+                        effective_threshold = self.config.price_change_threshold
+                    
+                    if price_change < effective_threshold:
+                        self.logger.info(f"⏭️  Skip rebalance: {state.market.title[:30]}... (price Δ {price_change:.2%} < {effective_threshold:.2%})")
                         state.last_rebalance = datetime.now()
                         state.market = updated
                         continue
                     else:
-                        self.logger.info(f"🔄 Rebalancing: {state.market.title[:40]}... (price moved {price_change:.2%})")
+                        self.logger.info(f"🔄 Rebalancing: {state.market.title[:40]}... (price moved {price_change:.2%} >= {effective_threshold:.2%})")
                 else:
                     self.logger.info(f"🔄 Rebalancing: {state.market.title[:40]}...")
                 
