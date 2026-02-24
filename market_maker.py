@@ -1126,15 +1126,63 @@ class MarketMakerBot:
         
         self.logger.info("✅ MarketMakerBot initialized")
     
+    # Файл для сохранения ID ордеров между сессиями
+    _ORDERS_FILE = ".bot_active_orders.json"
+    
+    def _save_order_ids(self) -> None:
+        """Сохранить ID всех активных ордеров в файл для восстановления при рестарте."""
+        try:
+            ids = [oid for oid, o in self.active_orders.items() if o.status == OrderStatus.OPEN]
+            with open(self._ORDERS_FILE, "w") as f:
+                json.dump(ids, f)
+        except Exception:
+            pass
+    
+    async def _cancel_saved_orders(self) -> int:
+        """
+        Загрузить ID ордеров из файла предыдущей сессии и отменить их ВСЕ.
+        
+        Это единственный надёжный способ отменить "призрачные" ордера,
+        потому что API get_open_orders() может возвращать пустой список
+        сразу после логина (задержка до 45+ секунд).
+        
+        Файл .bot_active_orders.json содержит ID ордеров, которые бот
+        создал в прошлой сессии. Мы их отменяем безусловно.
+        """
+        try:
+            with open(self._ORDERS_FILE, "r") as f:
+                saved_ids = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self.logger.info("🧹 No saved orders file — clean start")
+            return 0
+        
+        if not saved_ids:
+            return 0
+        
+        # Убираем ID которые уже в нашем трекинге (восстановлены через recovery)
+        tracked = set(self.active_orders.keys())
+        to_cancel = [oid for oid in saved_ids if oid not in tracked]
+        
+        if not to_cancel:
+            self.logger.info(f"🧹 All {len(saved_ids)} saved order(s) already tracked — no ghosts")
+            return 0
+        
+        self.logger.warning(f"🧹 Found {len(to_cancel)} ghost order(s) from previous session file, cancelling...")
+        result = await self.graphql_client.cancel_orders_rest(to_cancel)
+        cancelled = len(result.get("removed", []))
+        noop = len(result.get("noop", []))
+        if cancelled:
+            self.logger.info(f"  ✅ Cancelled {cancelled} ghost order(s)")
+            self.orders_cancelled += cancelled
+        if noop:
+            self.logger.info(f"  ℹ️ {noop} order(s) already filled/expired")
+        
+        return cancelled
+    
     async def _cancel_ghost_orders(self) -> int:
         """
         Найти и отменить все ордера на бирже, которые НЕ в нашем трекинге.
-        
-        Это "призрачные" ордера от предыдущих сессий бота, которые не были
-        отменены при shutdown (например, если sync удалил их из трекинга,
-        но на бирже они остались).
-        
-        Вызывается при старте и в каждом цикле ребалансировки.
+        Дополнительная защита на случай если файл не помог.
         """
         try:
             exchange_orders = await self.graphql_client.get_open_orders("OPEN")
@@ -1159,9 +1207,6 @@ class MarketMakerBot:
             if cancelled:
                 self.logger.info(f"  ✅ Cancelled {cancelled} ghost order(s)")
                 self.orders_cancelled += cancelled
-            noop = len(result.get("noop", []))
-            if noop:
-                self.logger.info(f"  ℹ️ {noop} ghost order(s) already filled/expired")
             return cancelled
             
         except Exception as e:
@@ -1815,6 +1860,7 @@ class MarketMakerBot:
             key = order_info.order_id or order_info.order_hash
             self.active_orders[key] = order_info
             self.orders_placed += 1
+            self._save_order_ids()
             
             self.logger.info(f"  ✅ {outcome.name} {side.name} @ {price:.4f}")
             return order_info
@@ -3343,7 +3389,9 @@ class MarketMakerBot:
                 else:
                     self.logger.info("⏭️  Position recovery disabled")
                 
-                # Отменяем "призрачные" ордера от предыдущих сессий
+                # Отменяем ордера от предыдущей сессии через файл
+                # (API может возвращать пустой список до 45 сек после логина)
+                await self._cancel_saved_orders()
                 await self._cancel_ghost_orders()
                 
                 # Главный цикл бота с быстрой проверкой цен
@@ -3441,6 +3489,8 @@ class MarketMakerBot:
         self.logger.info("🛑 Shutting down...")
         self._running = False
         await self.cancel_old_orders()
+        await self._cancel_ghost_orders()
+        self._save_order_ids()
         self.log_statistics()
         self.logger.info("👋 Goodbye!")
 
