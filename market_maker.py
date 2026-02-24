@@ -1126,6 +1126,48 @@ class MarketMakerBot:
         
         self.logger.info("✅ MarketMakerBot initialized")
     
+    async def _cancel_ghost_orders(self) -> int:
+        """
+        Найти и отменить все ордера на бирже, которые НЕ в нашем трекинге.
+        
+        Это "призрачные" ордера от предыдущих сессий бота, которые не были
+        отменены при shutdown (например, если sync удалил их из трекинга,
+        но на бирже они остались).
+        
+        Вызывается при старте и в каждом цикле ребалансировки.
+        """
+        try:
+            exchange_orders = await self.graphql_client.get_open_orders("OPEN")
+            if not exchange_orders:
+                return 0
+            
+            tracked_ids = set(self.active_orders.keys())
+            ghost_ids = []
+            
+            for ow in exchange_orders:
+                order = ow.get("order", ow)
+                oid = str(ow.get("id", order.get("id", order.get("orderId", ""))))
+                if oid and oid not in tracked_ids:
+                    ghost_ids.append(oid)
+            
+            if not ghost_ids:
+                return 0
+            
+            self.logger.warning(f"🧹 Found {len(ghost_ids)} ghost order(s) not in tracking — cancelling...")
+            result = await self.graphql_client.cancel_orders_rest(ghost_ids)
+            cancelled = len(result.get("removed", []))
+            if cancelled:
+                self.logger.info(f"  ✅ Cancelled {cancelled} ghost order(s)")
+                self.orders_cancelled += cancelled
+            noop = len(result.get("noop", []))
+            if noop:
+                self.logger.info(f"  ℹ️ {noop} ghost order(s) already filled/expired")
+            return cancelled
+            
+        except Exception as e:
+            self.logger.warning(f"⚠️ Ghost order cleanup error: {e}")
+            return 0
+    
     async def get_suitable_markets(self) -> list[MarketData]:
         """
         Получить подходящие рынки для маркет-мейкинга
@@ -3296,12 +3338,13 @@ class MarketMakerBot:
                 # Восстанавливаем состояние после перезапуска
                 markets_with_orders: set[str] = set()
                 if self.config.recover_positions_on_start:
-                    # Сначала загружаем существующие ордера
                     markets_with_orders = await self._recover_open_orders()
-                    # Затем проверяем незахеджированные позиции
                     await self._recover_positions()
                 else:
                     self.logger.info("⏭️  Position recovery disabled")
+                
+                # Отменяем "призрачные" ордера от предыдущих сессий
+                await self._cancel_ghost_orders()
                 
                 # Главный цикл бота с быстрой проверкой цен
                 # ВАЖНО: Устанавливаем время в прошлое чтобы первая ребалансировка была СРАЗУ
@@ -3345,42 +3388,14 @@ class MarketMakerBot:
                             markets = await self.get_suitable_markets()
                             
                             if markets:
-                                # Получаем ВСЕ открытые ордера с биржи ОДИН раз
-                                # чтобы обнаружить и отменить "призрачные" ордера
-                                # от предыдущих сессий перед размещением новых
-                                exchange_orders = await self.graphql_client.get_open_orders("OPEN")
-                                exchange_by_market: dict[str, list[str]] = {}
-                                for ow in (exchange_orders or []):
-                                    _order = ow.get("order", ow)
-                                    _oid = str(ow.get("id", _order.get("id", _order.get("orderId", ""))))
-                                    _mid = str(
-                                        ow.get("marketId") or
-                                        ow.get("market", {}).get("id") or
-                                        _order.get("marketId") or ""
-                                    )
-                                    if _mid and _oid:
-                                        if _mid not in exchange_by_market:
-                                            exchange_by_market[_mid] = []
-                                        exchange_by_market[_mid].append(_oid)
+                                # Отменяем ВСЕ призрачные ордера (на любых рынках)
+                                await self._cancel_ghost_orders()
                                 
-                                # Размещаем ордера на новых рынках
                                 for market in markets[:5]:
-                                    # Пропускаем если уже есть ордера
                                     if market.market_id in self.markets:
                                         continue
                                     if market.market_id in markets_with_orders:
                                         continue
-                                    
-                                    # Отменяем "призрачные" ордера от предыдущих сессий
-                                    old_ids = exchange_by_market.get(market.market_id, [])
-                                    if old_ids:
-                                        self.logger.warning(f"🧹 Found {len(old_ids)} ghost order(s) on {market.title[:30]}... from previous session")
-                                        result = await self.graphql_client.cancel_orders_rest(old_ids)
-                                        cancelled = len(result.get("removed", []))
-                                        if cancelled:
-                                            self.logger.info(f"  ✅ Cancelled {cancelled} ghost order(s)")
-                                            self.orders_cancelled += cancelled
-                                        await asyncio.sleep(self.config.api_delay_sec)
                                     
                                     await self.place_limit_orders(market)
                                     await asyncio.sleep(self.config.api_delay_sec)
