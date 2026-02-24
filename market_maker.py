@@ -2216,30 +2216,38 @@ class MarketMakerBot:
                     if existing_position:
                         position_info, other_outcome = existing_position
                         self.logger.info(f"  ⚠️  Market unsuitable but has position: {position_info['name']} ${position_info['value_usd']:.2f}")
-                        self.logger.info(f"  🛡️ Keeping market for hedge management only")
                         
-                        # Оставляем рынок в tracking только для hedge
-                        state.has_unhedged_position = True
-                        state.market = updated or state.market
-                        
-                        # Размещаем hedge ордер с АГРЕССИВНОЙ ценой
-                        aggressive_price = self._get_aggressive_hedge_price(other_outcome.ask_price)
-                        size_usd = position_info['value_usd']
-                        size_wei = int(Decimal(str(size_usd / float(aggressive_price))) * WEI_MULTIPLIER)
-                        
-                        self.logger.info(f"  🚀 Aggressive hedge: ask={other_outcome.ask_price} → price={aggressive_price} (+{self.config.hedge_price_slippage:.0%} slippage)")
-                        
-                        order = await self._place_single_order(
-                            market=state.market,
-                            outcome=other_outcome,
-                            side=Side.BUY,
-                            price=aggressive_price,
-                            size_wei=size_wei
-                        )
-                        if order:
-                            self.logger.info(f"  ✅ Hedge order placed: {other_outcome.name} @ ${float(aggressive_price):.4f}")
-                        
-                        state.last_rebalance = datetime.now()
+                        # В PASSIVE_POINTS и BALANCED — НЕ хеджируем!
+                        # Hedge с агрессивной ценой = гарантированный убыток
+                        # (entry_price + hedge_price > $1.00)
+                        if self.config.strategy_mode.upper() in ["PASSIVE_POINTS", "BALANCED"]:
+                            self.logger.warning(f"  🛡️ PASSIVE mode: NOT placing hedge (would cause guaranteed loss)")
+                            self.logger.warning(f"  💡 Wait for market expiry or sell manually on predict.fun")
+                            state.market = updated or state.market
+                            state.last_rebalance = datetime.now()
+                        else:
+                            self.logger.info(f"  🛡️ Keeping market for hedge management only")
+                            
+                            state.has_unhedged_position = True
+                            state.market = updated or state.market
+                            
+                            aggressive_price = self._get_aggressive_hedge_price(other_outcome.ask_price)
+                            size_usd = position_info['value_usd']
+                            size_wei = int(Decimal(str(size_usd / float(aggressive_price))) * WEI_MULTIPLIER)
+                            
+                            self.logger.info(f"  🚀 Aggressive hedge: ask={other_outcome.ask_price} → price={aggressive_price} (+{self.config.hedge_price_slippage:.0%} slippage)")
+                            
+                            order = await self._place_single_order(
+                                market=state.market,
+                                outcome=other_outcome,
+                                side=Side.BUY,
+                                price=aggressive_price,
+                                size_wei=size_wei
+                            )
+                            if order:
+                                self.logger.info(f"  ✅ Hedge order placed: {other_outcome.name} @ ${float(aggressive_price):.4f}")
+                            
+                            state.last_rebalance = datetime.now()
                     else:
                         # Нет позиции - можно безопасно удалить
                         # НО: не удаляем если рынок помечен как hedge-only (has_unhedged_position)
@@ -2322,19 +2330,30 @@ class MarketMakerBot:
                     )
                     self.logger.info(f"    📝 Order {order_id}: market={market_id[:10] if market_id else 'N/A'}... token={token_id[:10] if token_id else 'N/A'}...")
             
+            # Группируем загруженные ордера по market_id для state.our_orders
+            orders_by_market: dict[str, list[OrderInfo]] = {}
+            for oid, oinfo in self.active_orders.items():
+                mid = oinfo.market_id
+                if mid:
+                    if mid not in orders_by_market:
+                        orders_by_market[mid] = []
+                    orders_by_market[mid].append(oinfo)
+            
             # Добавляем рынки с ордерами в self.markets для отслеживания
-            # ВАЖНО: устанавливаем last_rebalance чтобы НЕ делать немедленную ребалансировку!
             for market_id in markets_with_orders:
                 if market_id not in self.markets:
-                    # Получаем данные рынка
                     try:
                         market = await self.graphql_client.get_market(market_id)
                         if market:
+                            market_orders = orders_by_market.get(market_id, [])
                             self.markets[market_id] = MarketState(
                                 market=market,
                                 entered_at=datetime.now(),
-                                last_rebalance=datetime.now()  # ВАЖНО: не ребалансировать сразу!
+                                last_rebalance=datetime.now(),
+                                our_orders=market_orders,
+                                last_mid_price=Decimal(str(market.chance_percentage / 100.0))
                             )
+                            self.logger.info(f"    📦 Market {market.title[:30]}... with {len(market_orders)} order(s)")
                     except Exception as e:
                         self.logger.debug(f"    Could not load market {market_id}: {e}")
             
@@ -2541,8 +2560,31 @@ class MarketMakerBot:
         threshold = self.config.price_proximity_threshold
         
         try:
-            for market_id, state in list(self.markets.items()):
-                if not state.our_orders:
+            # Собираем ВСЕ ордера из self.active_orders, сгруппированные по рынку
+            # Это гарантирует проверку ВСЕХ ордеров, включая восстановленные и hedge
+            orders_by_market: dict[str, list[tuple[str, OrderInfo]]] = {}
+            for order_id, order_info in list(self.active_orders.items()):
+                if order_info.status != OrderStatus.OPEN:
+                    continue
+                mid = order_info.market_id
+                if mid:
+                    if mid not in orders_by_market:
+                        orders_by_market[mid] = []
+                    orders_by_market[mid].append((order_id, order_info))
+            
+            # Также добавляем ордера из state.our_orders (на случай рассинхронизации)
+            for market_id, state in self.markets.items():
+                for order in state.our_orders:
+                    if order.order_id and market_id not in orders_by_market:
+                        orders_by_market[market_id] = []
+                    if order.order_id and not any(oid == order.order_id for oid, _ in orders_by_market.get(market_id, [])):
+                        orders_by_market[market_id].append((order.order_id, order))
+            
+            if not orders_by_market:
+                return 0
+            
+            for market_id, market_orders in orders_by_market.items():
+                if not market_orders:
                     continue
                 
                 # Получаем актуальную цену рынка
@@ -2550,17 +2592,19 @@ class MarketMakerBot:
                 if not updated_market:
                     continue
                 
-                current_mid = Decimal(str(updated_market.chance_percentage / 100.0))
+                state = self.markets.get(market_id)
+                market_title = (state.market.title if state else updated_market.title)[:40]
                 
-                orders_to_cancel: list[str] = []
+                current_mid = Decimal(str(updated_market.chance_percentage / 100.0))
                 no_mid = Decimal("1") - current_mid
                 
-                for order in state.our_orders:
-                    order_price = float(order.price)
+                orders_to_cancel: list[str] = []
+                
+                for order_id, order_info in market_orders:
+                    order_price = float(order_info.price)
+                    if order_price <= 0:
+                        continue
                     
-                    # Проверяем приближение цены к ордеру с обеих сторон:
-                    # YES-ордер сравниваем с current_mid, NO-ордер — с (1 - current_mid)
-                    # Берём минимальную дистанцию чтобы защитить оба направления
                     yes_diff = abs(float(current_mid) - order_price)
                     no_diff = abs(float(no_mid) - order_price)
                     price_diff = min(yes_diff, no_diff)
@@ -2569,29 +2613,30 @@ class MarketMakerBot:
                         closer_side = "YES" if yes_diff <= no_diff else "NO"
                         closer_mid = float(current_mid) if closer_side == "YES" else float(no_mid)
                         self.logger.warning(f"🚨 PRICE CLOSE TO ORDER!")
-                        self.logger.warning(f"   Market: {state.market.title[:40]}...")
+                        self.logger.warning(f"   Market: {market_title}...")
                         self.logger.warning(f"   Order @ ${order_price:.2f}, {closer_side} mid: ${closer_mid:.2f}")
                         self.logger.warning(f"   Distance: {price_diff:.2%} <= threshold {threshold:.2%}")
                         self.logger.warning(f"   ⚡ CANCELLING to prevent fill!")
-                        orders_to_cancel.append(order.order_id)
+                        orders_to_cancel.append(order_id)
                 
                 if orders_to_cancel:
                     result = await self.graphql_client.cancel_orders_rest(orders_to_cancel)
                     
-                    # Обрабатываем успешно отменённые
                     if result["removed"]:
                         cancelled_count += len(result["removed"])
                         self.orders_cancelled += len(result["removed"])
                         self.logger.info(f"   ✅ Cancelled {len(result['removed'])} order(s) - PROTECTED!")
                     
-                    # Обрабатываем noop (уже исполнились!)
                     if result["noop"]:
                         self.logger.warning(f"   ⚠️ {len(result['noop'])} order(s) ALREADY FILLED before cancel!")
                         self.orders_filled += len(result["noop"])
                     
-                    # Удаляем ВСЕ из локального состояния (и removed и noop)
+                    # Удаляем из ОБОИХ хранилищ
                     all_processed = set(result["removed"]) | set(result["noop"])
-                    state.our_orders = [o for o in state.our_orders if o.order_id not in all_processed]
+                    for pid in all_processed:
+                        self.active_orders.pop(pid, None)
+                    if state:
+                        state.our_orders = [o for o in state.our_orders if o.order_id not in all_processed]
                 
                 await asyncio.sleep(self.config.api_delay_sec)
             
