@@ -208,8 +208,8 @@ class BotConfig:
     # Market filters / Фильтры рынков
     min_liquidity_usd: float = 0.0       # Минимальная ликвидность ($)
     max_liquidity_usd: float = 15000.0   # Максимальная ликвидность ($) — низкая = больше поинтов
-    min_probability: float = 0.40        # Минимальная вероятность (40%)
-    max_probability: float = 0.60        # Максимальная вероятность (60%) — "uncertain markets" 2x
+    min_probability: float = 0.45        # Минимальная вероятность (45%) — максимальный мультипликатор
+    max_probability: float = 0.55        # Максимальная вероятность (55%) — "uncertain markets" 2x
     
     # Position limits / Лимиты позиций
     max_position_usd: float = 50.0       # Максимум $ на одну позицию
@@ -241,14 +241,14 @@ class BotConfig:
                                               # ask_price * (1 + slippage) = aggressive price
     
     # Strategy mode / Режим стратегии
-    # "PASSIVE_POINTS" - spread 25%, минимум риска, меньше поинтов
-    # "BALANCED"       - spread 10%, умеренный риск, больше поинтов (РЕКОМЕНДУЕТСЯ!)
+    # "PASSIVE_POINTS" - spread 18%, минимум риска исполнения, оптимум поинтов (РЕКОМЕНДУЕТСЯ!)
+    # "BALANCED"       - spread 15%, умеренный риск, больше поинтов
     # "DELTA_NEUTRAL"  - spread 2%, высокий риск, максимум поинтов
     # "AGGRESSIVE"     - spread 0.5%, очень высокий риск
-    strategy_mode: str = "BALANCED"          # РЕКОМЕНДУЕМЫЙ РЕЖИМ!
+    strategy_mode: str = "PASSIVE_POINTS"    # РЕКОМЕНДУЕМЫЙ РЕЖИМ! Ордера висят для поинтов, не исполняются
     
     # Spread settings for each mode / Настройки spread для режимов
-    passive_spread: float = 0.25             # PASSIVE: 25% - ордера почти никогда не исполнятся
+    passive_spread: float = 0.18             # PASSIVE: 18% - баланс поинтов и безопасности (15-20% sweet spot)
     balanced_spread: float = 0.15            # BALANCED: 15% - увеличено для защиты от пустых стаканов
     
     # 📊 ORDERBOOK LEVELS MODE - позиционирование по уровням стакана
@@ -261,9 +261,10 @@ class BotConfig:
     # 🛡️ ЗАЩИТА ОТ ИСПОЛНЕНИЯ (для PASSIVE_POINTS и BALANCED)
     # Отменяем ордера если цена приблизилась слишком близко
     cancel_when_price_close: bool = True     # Включить защитную отмену
-    price_proximity_threshold: float = 0.10  # Отменить если цена в пределах 10% от ордера
-                                              # Пример: ордер @ 0.30, цена 0.33 → отменить!
-    price_check_interval_sec: int = 60       # Проверять цены каждые 60 секунд (быстро!)
+    price_proximity_threshold: float = 0.05  # Отменить если цена в пределах 5% от ордера
+                                              # При spread 18%: буфер = 13% до отмены
+                                              # Пример: ордер @ 0.32, цена 0.36 → отменить!
+    price_check_interval_sec: int = 45       # Проверять цены каждые 45 секунд (быстрее реакция)
     
     # Timing / Тайминги
     rebalance_interval_sec: int = 1200   # Интервал ребалансировки (20 минут - больше времени для fill!)
@@ -1589,7 +1590,7 @@ class MarketMakerBot:
                 # =====================================================
                 # Ставим ордера ДАЛЕКО от рынка - они НЕ исполнятся!
                 # Получаем points за предоставление ликвидности без риска.
-                spread = Decimal(str(self.config.passive_spread))  # 20% по умолчанию
+                spread = Decimal(str(self.config.passive_spread))
                 
                 self.logger.info(f"  🛡️ PASSIVE_POINTS MODE: {float(spread):.0%} spread (orders won't fill!)")
                 self.logger.info(f"  💰 You earn points for liquidity WITHOUT execution risk")
@@ -1598,11 +1599,10 @@ class MarketMakerBot:
                 bid_price = self._round_price(mid_price - spread, round_up=False)
                 outcome_1_price = self._round_price(Decimal("1") - mid_price - spread, round_up=False)
                 
-                # Проверяем что цены в допустимом диапазоне
-                if bid_price < Decimal("0.01"):
-                    bid_price = Decimal("0.01")
-                if outcome_1_price < Decimal("0.01"):
-                    outcome_1_price = Decimal("0.01")
+                # Ограничиваем диапазон [0.01, 0.85] — не ставим выше 0.85 чтобы не попасть
+                # на исполнение при резком движении к resolution price (0 или 1)
+                bid_price = max(Decimal("0.01"), min(bid_price, Decimal("0.85")))
+                outcome_1_price = max(Decimal("0.01"), min(outcome_1_price, Decimal("0.85")))
                     
             elif strategy == "BALANCED":
                 # =====================================================
@@ -1645,11 +1645,9 @@ class MarketMakerBot:
                     bid_price = self._round_price(mid_price - spread, round_up=False)
                     outcome_1_price = self._round_price(Decimal("1") - mid_price - spread, round_up=False)
                 
-                # Проверяем границы
-                if bid_price < Decimal("0.01"):
-                    bid_price = Decimal("0.01")
-                if outcome_1_price < Decimal("0.01"):
-                    outcome_1_price = Decimal("0.01")
+                # Ограничиваем диапазон [0.01, 0.85] — аналогично PASSIVE_POINTS
+                bid_price = max(Decimal("0.01"), min(bid_price, Decimal("0.85")))
+                outcome_1_price = max(Decimal("0.01"), min(outcome_1_price, Decimal("0.85")))
                     
             elif strategy == "AGGRESSIVE" or self.config.aggressive_pricing:
                 # ⚡ Агрессивный режим - ордера БЫСТРО исполнятся
@@ -2540,18 +2538,24 @@ class MarketMakerBot:
                 current_mid = Decimal(str(updated_market.chance_percentage / 100.0))
                 
                 orders_to_cancel: list[str] = []
+                no_mid = Decimal("1") - current_mid
                 
                 for order in state.our_orders:
                     order_price = float(order.price)
                     
-                    # Проверяем приближение цены к ордеру
-                    # Для BUY ордера: опасно когда цена ПАДАЕТ к нашему bid
-                    price_diff = abs(float(current_mid) - order_price)
+                    # Проверяем приближение цены к ордеру с обеих сторон:
+                    # YES-ордер сравниваем с current_mid, NO-ордер — с (1 - current_mid)
+                    # Берём минимальную дистанцию чтобы защитить оба направления
+                    yes_diff = abs(float(current_mid) - order_price)
+                    no_diff = abs(float(no_mid) - order_price)
+                    price_diff = min(yes_diff, no_diff)
                     
                     if price_diff <= threshold:
+                        closer_side = "YES" if yes_diff <= no_diff else "NO"
+                        closer_mid = float(current_mid) if closer_side == "YES" else float(no_mid)
                         self.logger.warning(f"🚨 PRICE CLOSE TO ORDER!")
                         self.logger.warning(f"   Market: {state.market.title[:40]}...")
-                        self.logger.warning(f"   Order @ ${order_price:.2f}, Current mid: ${float(current_mid):.2f}")
+                        self.logger.warning(f"   Order @ ${order_price:.2f}, {closer_side} mid: ${closer_mid:.2f}")
                         self.logger.warning(f"   Distance: {price_diff:.2%} <= threshold {threshold:.2%}")
                         self.logger.warning(f"   ⚡ CANCELLING to prevent fill!")
                         orders_to_cancel.append(order.order_id)
@@ -3148,10 +3152,11 @@ class MarketMakerBot:
         # Strategy mode explanation
         strategy = self.config.strategy_mode.upper()
         if strategy == "PASSIVE_POINTS":
-            self.logger.info(f"  🛡️ Strategy: PASSIVE_POINTS (SAFEST - minimal fills)")
-            self.logger.info(f"  🛡️ Spread: {self.config.passive_spread:.0%} (very far from market)")
+            self.logger.info(f"  🛡️ Strategy: PASSIVE_POINTS (RECOMMENDED - safe point farming)")
+            self.logger.info(f"  🛡️ Spread: {self.config.passive_spread:.0%} (far from market, won't fill)")
+            self.logger.info(f"  🛡️ Price cap: 0.85 (no orders near resolution prices)")
             self.logger.info(f"  🛡️ NO hedging of existing positions")
-            self.logger.info(f"  ⚠️ Points efficiency: LOW (orders too far from mid-price)")
+            self.logger.info(f"  💰 Points efficiency: GOOD (optimized 15-20% sweet spot)")
         elif strategy == "BALANCED":
             self.logger.info(f"  ⚖️ Strategy: BALANCED (RECOMMENDED - good points, low risk)")
             if self.config.use_orderbook_levels:
