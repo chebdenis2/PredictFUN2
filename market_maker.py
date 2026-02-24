@@ -3345,6 +3345,24 @@ class MarketMakerBot:
                             markets = await self.get_suitable_markets()
                             
                             if markets:
+                                # Получаем ВСЕ открытые ордера с биржи ОДИН раз
+                                # чтобы обнаружить и отменить "призрачные" ордера
+                                # от предыдущих сессий перед размещением новых
+                                exchange_orders = await self.graphql_client.get_open_orders("OPEN")
+                                exchange_by_market: dict[str, list[str]] = {}
+                                for ow in (exchange_orders or []):
+                                    _order = ow.get("order", ow)
+                                    _oid = str(ow.get("id", _order.get("id", _order.get("orderId", ""))))
+                                    _mid = str(
+                                        ow.get("marketId") or
+                                        ow.get("market", {}).get("id") or
+                                        _order.get("marketId") or ""
+                                    )
+                                    if _mid and _oid:
+                                        if _mid not in exchange_by_market:
+                                            exchange_by_market[_mid] = []
+                                        exchange_by_market[_mid].append(_oid)
+                                
                                 # Размещаем ордера на новых рынках
                                 for market in markets[:5]:
                                     # Пропускаем если уже есть ордера
@@ -3352,6 +3370,17 @@ class MarketMakerBot:
                                         continue
                                     if market.market_id in markets_with_orders:
                                         continue
+                                    
+                                    # Отменяем "призрачные" ордера от предыдущих сессий
+                                    old_ids = exchange_by_market.get(market.market_id, [])
+                                    if old_ids:
+                                        self.logger.warning(f"🧹 Found {len(old_ids)} ghost order(s) on {market.title[:30]}... from previous session")
+                                        result = await self.graphql_client.cancel_orders_rest(old_ids)
+                                        cancelled = len(result.get("removed", []))
+                                        if cancelled:
+                                            self.logger.info(f"  ✅ Cancelled {cancelled} ghost order(s)")
+                                            self.orders_cancelled += cancelled
+                                        await asyncio.sleep(self.config.api_delay_sec)
                                     
                                     await self.place_limit_orders(market)
                                     await asyncio.sleep(self.config.api_delay_sec)
